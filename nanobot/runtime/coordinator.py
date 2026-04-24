@@ -1411,13 +1411,14 @@ def _build_task_plan_snapshot(
                 "artifact_path": materialized_improvement_artifact_path,
             }
         active_artifact_path = materialized_improvement_artifact_path
-    latest_noop = _safe_read_json(workspace / "state" / "self_evolution" / "runtime" / "latest_noop.json")
+    latest_noop = _safe_read_json(workspace / "state" / "self_evolution" / "runtime" / "latest_noop.json") or {}
     subagent_lane_health = _subagent_lane_health(state_root=workspace / "state", current_task_id=current_task_id)
     should_retire_subagent_lane = (
         current_task_id == "subagent-verify-materialized-improvement"
+        and not (isinstance(feedback_decision, dict) and feedback_decision.get("mode") == "execute_queued_revert")
         and (
             latest_noop.get("status") == "terminal_noop"
-            or subagent_lane_health.get("state") in {"stale", "missing_request"}
+            or subagent_lane_health.get("state") == "stale"
             or (experiment.get("outcome") == "discard" and experiment.get("revert_status") == "skipped_no_material_change")
         )
     )
