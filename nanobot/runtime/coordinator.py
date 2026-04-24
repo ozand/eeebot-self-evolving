@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from nanobot.runtime.autoevolve import resolve_terminal_selfevo_issue
+from nanobot.runtime.state import _subagent_rollup_snapshot
 from nanobot.utils.helpers import estimate_prompt_tokens
 
 PROMOTION_RECORD_VERSION = 'promotion-record-v1'
@@ -985,6 +987,7 @@ def _derive_generated_candidates(
     result_status: str,
     current_task_id: str | None,
     failure_learning: dict[str, Any] | None = None,
+    retire_analyze_last_failed_candidate: bool = False,
 ) -> list[dict[str, Any]]:
     history_entries = _load_recent_history_entries(goals_dir / "history", limit=6)
     if result_status != "PASS":
@@ -996,7 +999,7 @@ def _derive_generated_candidates(
         else:
             break
     candidates: list[dict[str, Any]] = []
-    if isinstance(failure_learning, dict):
+    if isinstance(failure_learning, dict) and not retire_analyze_last_failed_candidate:
         candidates.append({
             'task_id': 'analyze-last-failed-candidate',
             'title': 'Analyze the last failed self-evolution candidate before retrying mutation',
@@ -1298,30 +1301,58 @@ def _build_task_plan_snapshot(
                 task["status"] = "pending"
     latest_failure_learning = _latest_failure_learning(workspace)
     failure_learning_is_fresh = isinstance(latest_failure_learning, dict) and isinstance(latest_failure_learning.get('_age_seconds'), int) and latest_failure_learning.get('_age_seconds') <= 3600
+    terminal_selfevo_issue = resolve_terminal_selfevo_issue(workspace=workspace, source_task_id='analyze-last-failed-candidate')
     if isinstance(latest_failure_learning, dict) and (current_task_id == "record-reward" or failure_learning_is_fresh):
-        repair_task = next((task for task in tasks if task.get("task_id") == "analyze-last-failed-candidate"), None)
-        if repair_task is None:
-            repair_task = {
-                'task_id': 'analyze-last-failed-candidate',
-                'title': 'Analyze the last failed self-evolution candidate before retrying mutation',
-                'status': 'active',
-                'kind': 'review',
-                'acceptance': 'produce a bounded explanation of the failed candidate and one safer follow-up mutation idea',
-                'selection_source': 'generated_from_failure_learning',
-                'failed_candidate_id': latest_failure_learning.get('candidate_id'),
-                'failed_commit': latest_failure_learning.get('failed_commit'),
-                'health_reasons': latest_failure_learning.get('health_reasons'),
+        if terminal_selfevo_issue is not None:
+            for task in tasks:
+                if task.get("task_id") == "analyze-last-failed-candidate":
+                    task["status"] = "done"
+                    task["terminal_reason"] = terminal_selfevo_issue.get("terminal_status") or "terminal_selfevo_issue"
+                elif task.get("task_id") == "record-reward":
+                    task["status"] = "active"
+                elif task.get("status") == "active":
+                    task["status"] = "pending"
+            if not any(task.get("task_id") == "record-reward" for task in tasks):
+                tasks.append({"task_id": "record-reward", "title": "Record cycle reward", "status": "active"})
+            current_task_id = "record-reward"
+            feedback_decision = {
+                "mode": "retire_terminal_selfevo_lane",
+                "reason": "latest self-evolution issue reached a terminal merged/closed or terminal no-op state; do not recreate analyze-last-failed-candidate",
+                "reward_value": reward_signal.get("value") if isinstance(reward_signal, dict) else None,
+                "current_task_id": "analyze-last-failed-candidate",
+                "current_task_class": _task_action_class("analyze-last-failed-candidate"),
+                "selected_task_id": "record-reward",
+                "selected_task_class": _task_action_class("record-reward"),
+                "selection_source": "feedback_terminal_selfevo_retire",
+                "selected_task_title": "Record cycle reward",
+                "selected_task_label": "Record cycle reward [task_id=record-reward]",
+                "terminal_selfevo_issue": terminal_selfevo_issue,
             }
-            tasks.append(repair_task)
-        for task in tasks:
-            task['status'] = 'pending' if task.get('task_id') != 'analyze-last-failed-candidate' and task.get('status') == 'active' else task.get('status')
-        repair_task['status'] = 'active'
-        current_task_id = 'analyze-last-failed-candidate'
+        else:
+            repair_task = next((task for task in tasks if task.get("task_id") == "analyze-last-failed-candidate"), None)
+            if repair_task is None:
+                repair_task = {
+                    'task_id': 'analyze-last-failed-candidate',
+                    'title': 'Analyze the last failed self-evolution candidate before retrying mutation',
+                    'status': 'active',
+                    'kind': 'review',
+                    'acceptance': 'produce a bounded explanation of the failed candidate and one safer follow-up mutation idea',
+                    'selection_source': 'generated_from_failure_learning',
+                    'failed_candidate_id': latest_failure_learning.get('candidate_id'),
+                    'failed_commit': latest_failure_learning.get('failed_commit'),
+                    'health_reasons': latest_failure_learning.get('health_reasons'),
+                }
+                tasks.append(repair_task)
+            for task in tasks:
+                task['status'] = 'pending' if task.get('task_id') != 'analyze-last-failed-candidate' and task.get('status') == 'active' else task.get('status')
+            repair_task['status'] = 'active'
+            current_task_id = 'analyze-last-failed-candidate'
     generated_candidates = _derive_generated_candidates(
         goals_dir=goals_dir,
         result_status=result_status,
         current_task_id=current_task_id,
         failure_learning=latest_failure_learning,
+        retire_analyze_last_failed_candidate=terminal_selfevo_issue is not None,
     )
     carried_candidates = [dict(item) for item in recorded_generated_candidates if isinstance(item, dict)] if 'recorded_generated_candidates' in locals() else []
     inferred_candidates = _inferred_generated_candidates_from_tasks(tasks)
@@ -2267,6 +2298,11 @@ async def run_self_evolving_cycle(
     if subagent_request_path:
         current_plan["subagent_request_path"] = subagent_request_path
         experiment["budget_used"]["subagents"] = max(int(experiment["budget_used"].get("subagents") or 0), 1)
+    subagent_rollup = _subagent_rollup_snapshot(
+        state_root=state_root,
+        current_task_id=current_plan.get("current_task_id"),
+        current_task_title=current_plan.get("current_task"),
+    )
     if promotion_candidate_id and promotion_path is not None:
         final_artifact_path = current_plan.get("materialized_improvement_artifact_path") or ((current_plan.get("feedback_decision") or {}).get("artifact_path") if isinstance(current_plan.get("feedback_decision"), dict) else None)
         final_promotion_record = {
@@ -2373,6 +2409,16 @@ async def run_self_evolving_cycle(
             "experiment_id": experiment_id,
             "materialized_improvement_artifact_path": current_plan.get("materialized_improvement_artifact_path"),
         },
+        "goal_context": {
+            "subagent_rollup": subagent_rollup or {
+                "enabled": False,
+                "count_total": 0,
+                "count_done": 0,
+                "count_queued": 0,
+                "count_completed": 0,
+                "count_stale": 0,
+            }
+        },
     }
     if result_status == "BLOCK":
         outbox["goal"]["follow_through"]["file_action"] = {
@@ -2406,10 +2452,13 @@ async def run_self_evolving_cycle(
             },
         },
         "goal_context": {
-            "subagent_rollup": {
+            "subagent_rollup": subagent_rollup or {
                 "enabled": False,
                 "count_total": 0,
                 "count_done": 0,
+                "count_queued": 0,
+                "count_completed": 0,
+                "count_stale": 0,
             }
         },
         "capability_gate": {
