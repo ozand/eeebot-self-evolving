@@ -44,6 +44,14 @@ def test_dashboard_truth_prefers_current_summary_and_flags_stale_legacy_active_e
             'task_selection_source': 'feedback_discard_revert_followthrough',
             'selected_tasks': 'Use one bounded subagent-assisted review [task_id=subagent-verify-materialized-improvement]',
         },
+        'blocker_summary': {
+            'schema_version': 'blocker-summary-v1',
+            'state': 'stagnant',
+            'reason': 'terminal no-op state persists',
+            'recommended_next_action': 'select a new bounded mutation or close the already terminal task',
+            'source': 'workspace_state',
+            'current_task_id': 'subagent-verify-materialized-improvement',
+        },
         'runtime_source': {'source': 'workspace_state'},
     }
     (state_root / 'control_plane' / 'current_summary.json').write_text(json.dumps(current_summary), encoding='utf-8')
@@ -55,9 +63,17 @@ def test_dashboard_truth_prefers_current_summary_and_flags_stale_legacy_active_e
     old = time.time() - 72 * 3600
     os.utime(active_exec_path, (old, old))
 
+    remote_freshness = {
+        'schema_version': 'selfevo-remote-freshness-v1',
+        'state': 'stale',
+        'remote_ref_stale': True,
+        'remote_head': '45f4949',
+        'default_branch_head': '2f2804e',
+    }
     raw = {
         'current_plan': current_summary['task_plan'],
         'outbox': {'status': 'PASS'},
+        'selfevo_remote_freshness': remote_freshness,
     }
     insert_collection(db, {
         'collected_at': '2026-04-24T07:30:00Z',
@@ -117,5 +133,9 @@ def test_dashboard_truth_prefers_current_summary_and_flags_stale_legacy_active_e
     control = system['control_plane']
     assert control['current_task'] == current_summary['task_plan']['current_task']
     assert control['current_blocker'] != 'Record cycle reward'
+    assert control['blocker_summary'] == current_summary['blocker_summary']
+    assert system['blocker_summary'] == current_summary['blocker_summary']
+    assert system['selfevo_remote_freshness'] == remote_freshness
+    assert control['selfevo_remote_freshness'] == remote_freshness
     assert control['active_execution']['staleness']['state'] == 'stale'
     assert control['active_execution']['legacy_path_reference_detected'] is True

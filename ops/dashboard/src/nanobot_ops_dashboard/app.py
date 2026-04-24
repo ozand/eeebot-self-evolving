@@ -217,6 +217,7 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
     repo_latest = dict(repo_latest) if repo_latest else {}
     eeepc_latest = dict(eeepc_latest) if eeepc_latest else {}
     repo_raw = _json_loads_dict(repo_latest.get('raw_json')) if repo_latest else {}
+    selfevo_remote_freshness = repo_raw.get('selfevo_remote_freshness') if isinstance(repo_raw, dict) else None
     producer_summary_path = cfg.project_root / 'workspace' / 'state' / 'control_plane' / 'current_summary.json'
     if not producer_summary_path.exists():
         alt_summary_path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'control_plane' / 'current_summary.json'
@@ -224,6 +225,9 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
     producer_summary = _structured_file_payload(producer_summary_path) if producer_summary_path.exists() else {}
     guarded_state_path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'self_evolution' / 'current_state.json'
     guarded_evolution = _structured_file_payload(guarded_state_path) if guarded_state_path.exists() else {}
+    if isinstance(guarded_evolution, dict) and selfevo_remote_freshness is not None:
+        guarded_evolution = dict(guarded_evolution)
+        guarded_evolution['remote_ref_freshness'] = selfevo_remote_freshness
     local_ci_state_path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'local_ci' / 'current_state.json'
     local_ci = _structured_file_payload(local_ci_state_path) if local_ci_state_path.exists() else {}
     active_exec_path = cfg.project_root / 'control' / 'active_execution.json'
@@ -281,7 +285,17 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
         'current_blocker': None if ((isinstance(producer_summary.get('task_plan'), dict) and producer_summary.get('task_plan', {}).get('current_task')) or (repo_latest or {}).get('current_task')) else current_blocker,
         'current_task': (producer_summary.get('task_plan') or {}).get('current_task') or (repo_latest or {}).get('current_task'),
         'producer_summary': producer_summary if isinstance(producer_summary, dict) else {},
+        'blocker_summary': (producer_summary.get('blocker_summary') if isinstance(producer_summary, dict) else None) or {
+            'schema_version': 'blocker-summary-v1',
+            'state': 'blocked' if current_blocker.get('kind') == 'block' else 'stagnant' if current_blocker.get('blocked_next_step') or current_blocker.get('failure_class') else 'clear',
+            'reason': current_blocker.get('blocked_next_step') or current_blocker.get('failure_class') or current_blocker.get('source') or 'none',
+            'recommended_next_action': current_blocker.get('blocked_next_step') or current_blocker.get('selected_task_title') or current_blocker.get('selected_tasks_text') or 'continue the current plan',
+            'source': current_blocker.get('source') or 'dashboard_current_blocker',
+            'current_task_id': (producer_summary.get('task_plan') or {}).get('current_task_id') if isinstance(producer_summary, dict) else None,
+            'current_task_title': (producer_summary.get('task_plan') or {}).get('current_task') if isinstance(producer_summary, dict) else None,
+        },
         'guarded_evolution': guarded_evolution if isinstance(guarded_evolution, dict) else {},
+        'selfevo_remote_freshness': selfevo_remote_freshness,
         'local_ci': local_ci if isinstance(local_ci, dict) else {},
         'runtime_source': (producer_summary.get('runtime_source') if isinstance(producer_summary, dict) else None),
         'prompt_mass': (producer_summary.get('prompt_mass') if isinstance(producer_summary, dict) else None),
@@ -781,7 +795,29 @@ def _experiment_snapshot_from_payload(payload, source_path: Path) -> dict | None
     metric_current = _first_present(experiment_payload, ('metric_current', 'metricCurrent'))
     metric_frontier = _first_present(experiment_payload, ('metric_frontier', 'metricFrontier'))
     contract_path = _first_present(experiment_payload, ('contract_path', 'contractPath'))
-    is_experiment_snapshot = any(_has_value(value) for value in (experiment_id, title_value, reward_signal, phase, outcome, metric_name, contract_path))
+    revert_payload = _first_present(experiment_payload, ('revert', 'revertRecord', 'revert_record'))
+    revert_path = _first_present(experiment_payload, ('revert_path', 'revertPath'))
+    revert_status = _first_present(experiment_payload, ('revert_status', 'revertStatus'))
+    revert_reason = _first_present(experiment_payload, ('revert_reason', 'revertReason', 'reason'))
+    revert_terminal = _first_present(experiment_payload, ('revert_terminal', 'revertTerminal', 'terminal'))
+    revert_contract_path = _first_present(experiment_payload, ('revert_contract_path', 'revertContractPath'))
+    if not isinstance(revert_payload, dict):
+        revert_payload = None
+    if revert_payload is None and (_has_value(revert_path) or _has_value(revert_status) or _has_value(revert_reason)):
+        revert_payload = {
+            'revert_path': revert_path,
+            'revert_status': revert_status,
+            'reason': revert_reason,
+            'terminal': revert_terminal,
+            'contract_path': revert_contract_path,
+        }
+    if isinstance(revert_payload, dict):
+        revert_path = revert_payload.get('revert_path') or revert_payload.get('revertPath') or revert_path
+        revert_status = revert_payload.get('revert_status') or revert_payload.get('revertStatus') or revert_status
+        revert_reason = revert_payload.get('reason') or revert_payload.get('revert_reason') or revert_reason
+        revert_terminal = revert_payload.get('terminal') if revert_payload.get('terminal') is not None else revert_terminal
+        revert_contract_path = revert_payload.get('contract_path') or revert_payload.get('contractPath') or revert_contract_path
+    is_experiment_snapshot = any(_has_value(value) for value in (experiment_id, title_value, reward_signal, phase, outcome, metric_name, contract_path, revert_path, revert_status))
     title = title_value or experiment_id or 'unknown experiment'
     collected_at = _first_present(experiment_payload, ('collected_at', 'collectedAt', 'finished_at', 'finishedAt', 'started_at', 'startedAt'))
     if not collected_at:
@@ -807,8 +843,12 @@ def _experiment_snapshot_from_payload(payload, source_path: Path) -> dict | None
         'metric_frontier': metric_frontier,
         'contract_path': str(contract_path) if _has_value(contract_path) else None,
         'revert_required': bool(experiment_payload.get('revert_required')),
-        'revert_status': _first_present(experiment_payload, ('revert_status', 'revertStatus')),
-        'revert_path': _first_present(experiment_payload, ('revert_path', 'revertPath')),
+        'revert_status': str(revert_status) if _has_value(revert_status) else None,
+        'revert_path': str(revert_path) if _has_value(revert_path) else None,
+        'revert_reason': str(revert_reason) if _has_value(revert_reason) else None,
+        'revert_terminal': bool(revert_terminal) if _has_value(revert_terminal) else None,
+        'revert_contract_path': str(revert_contract_path) if _has_value(revert_contract_path) else None,
+        'revert': revert_payload,
         'raw': payload,
     }
 
@@ -2094,6 +2134,7 @@ def create_app(cfg: DashboardConfig):
                 'local_files': system_visibility['local_files'],
                 'eeepc_outbox_preview': system_visibility['eeepc_outbox_preview'],
                 'control_plane': control_plane,
+                'blocker_summary': control_plane.get('blocker_summary'),
                 'autonomy_verdict': autonomy_verdict,
                 'runtime_parity': runtime_parity,
                 'host_resources': dict(repo_latest).get('host_resources') if repo_latest else None,
@@ -2103,6 +2144,7 @@ def create_app(cfg: DashboardConfig):
                 'subagent_rollup': control_plane.get('subagent_rollup') or (dict(repo_latest).get('subagent_rollup') if repo_latest else None),
                 'eeepc_reachability': eeepc_reachability,
                 'eeepc_reachability_age': eeepc_reachability_age,
+                'selfevo_remote_freshness': control_plane.get('selfevo_remote_freshness'),
             }
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
             start_response('200 OK', [('Content-Type', 'application/json; charset=utf-8')])
