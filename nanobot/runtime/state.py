@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -716,11 +717,11 @@ def load_runtime_state_from_root(state_root: Path, source_kind: str = "workspace
             task_obj = (result_obj or {}).get("task") if isinstance((result_obj or {}).get("task"), dict) else None
             goal_context = (task_obj or {}).get("goal_context") if isinstance((task_obj or {}).get("goal_context"), dict) else None
             subagent_rollup = (goal_context or {}).get("subagent_rollup") if isinstance(goal_context, dict) else None
-        subagent_rollup_from_files = _subagent_rollup_snapshot(
-            state_root=state_root,
-            current_task_id=current_task_id,
-            current_task_title=(normalized_current.get("current_task") if isinstance(normalized_current, dict) else None),
-        )
+            subagent_rollup_from_files = _subagent_rollup_snapshot(
+                state_root=state_root,
+                current_task_id=current_task_id,
+                current_task_title=(task_plan.get("current_task") if isinstance(task_plan, dict) else None),
+            )
         if subagent_rollup is None:
             subagent_rollup = subagent_rollup_from_files
         capability_gate = report_data.get("capability_gate") if isinstance(report_data.get("capability_gate"), dict) else None
