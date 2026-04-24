@@ -1595,6 +1595,8 @@ def create_app(cfg: DashboardConfig):
         experiment_visibility = _discover_experiment_visibility(cfg, plan_latest)
         credits_visibility = _discover_credits_visibility(cfg)
         hypotheses_visibility = _discover_hypotheses_visibility(cfg)
+        subagent_visibility = _discover_subagent_requests(cfg)
+        runtime_parity = _dashboard_runtime_parity(repo_plan_snapshot or plan_latest, eeepc_plan_snapshot, cfg)
         subagent_latest_event = all_subagent_events[0] if all_subagent_events else None
         latest_collected = None
         for row in [eeepc_latest, repo_latest]:
@@ -1745,6 +1747,14 @@ def create_app(cfg: DashboardConfig):
                     'title': summary.get('goal_id') or 'unknown',
                     'artifact': summary.get('report_path'),
                 }]
+        autonomy_verdict = _autonomy_verdict(
+            analytics=analytics,
+            plan_latest=plan_latest,
+            experiment_visibility=experiment_visibility,
+            credits_visibility=credits_visibility,
+            cfg=cfg,
+        )
+        analytics['autonomy_verdict'] = autonomy_verdict
 
         request_source = query.get('source', [''])[0]
         request_status = query.get('status', [''])[0]
@@ -1776,7 +1786,8 @@ def create_app(cfg: DashboardConfig):
             'cycles': cycles,
             'promotions': promotions,
             'subagent_events': subagent_events,
-            'subagents_available': bool(all_subagent_events),
+            'subagent_visibility': subagent_visibility,
+            'subagents_available': bool(all_subagent_events) or bool(subagent_visibility.get('requests')) or bool(subagent_visibility.get('results')),
             'subagent_latest_event': subagent_latest_event,
             'subagent_latest_age': _age_text(subagent_latest_event.get('collected_at') if subagent_latest_event else None, now),
             'experiment_visibility': experiment_visibility,
@@ -1837,6 +1848,8 @@ def create_app(cfg: DashboardConfig):
             'overview_subagent_cycle_id': overview_subagent_cycle_id,
             'overview_promotion_decision_trail': overview_promotion_decision_trail,
             'analytics': analytics,
+            'autonomy_verdict': autonomy_verdict,
+            'runtime_parity': runtime_parity,
             'plan_latest': plan_latest,
             'plan_latest_age': _age_text(plan_latest.get('collected_at') if isinstance(plan_latest, dict) else None, now),
             'plan_history': plan_history,
@@ -2005,6 +2018,23 @@ def create_app(cfg: DashboardConfig):
             start_response('200 OK', [('Content-Type', 'application/json; charset=utf-8')])
             return [body]
 
+        if path == '/api/subagents':
+            payload = {
+                **subagent_visibility,
+                'events': subagent_events,
+                'summary': {
+                    **subagent_visibility.get('summary', {}),
+                    'total_events': len(all_subagent_events),
+                    'filtered_events': len(subagent_events),
+                    'sources': subagent_sources,
+                    'statuses': subagent_statuses,
+                    'origins': subagent_origins,
+                },
+            }
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+            start_response('200 OK', [('Content-Type', 'application/json; charset=utf-8')])
+            return [body]
+
         if path == '/api/cycles':
             body = json.dumps({'items': cycles}, ensure_ascii=False, indent=2).encode('utf-8')
             start_response('200 OK', [('Content-Type', 'application/json; charset=utf-8')])
@@ -2061,6 +2091,8 @@ def create_app(cfg: DashboardConfig):
                 'local_files': system_visibility['local_files'],
                 'eeepc_outbox_preview': system_visibility['eeepc_outbox_preview'],
                 'control_plane': control_plane,
+                'autonomy_verdict': autonomy_verdict,
+                'runtime_parity': runtime_parity,
                 'host_resources': dict(repo_latest).get('host_resources') if repo_latest else None,
                 'host_resources': (control_plane.get('host_resources') if isinstance(control_plane, dict) else None),
                 'capabilities': control_plane.get('capabilities'),
