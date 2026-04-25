@@ -392,10 +392,10 @@ def test_cycle_persists_recorded_feedback_decision_into_latest_authority_artifac
         json.dumps(
             {
                 "schema_version": "task-plan-v1",
-                "current_task_id": "record-reward",
+                "current_task_id": "analyze-last-failed-candidate",
                 "tasks": [
-                    {"task_id": "analyze-last-failed-candidate", "title": "Analyze the last failed self-evolution candidate", "status": "done"},
-                    {"task_id": "record-reward", "title": "Record cycle reward", "status": "active"},
+                    {"task_id": "analyze-last-failed-candidate", "title": "Analyze the last failed self-evolution candidate", "status": "active"},
+                    {"task_id": "record-reward", "title": "Record cycle reward", "status": "pending"},
                 ],
                 "feedback_decision": recorded_feedback_decision,
             }
@@ -422,6 +422,7 @@ def test_cycle_persists_recorded_feedback_decision_into_latest_authority_artifac
     outbox = _read_json(tmp_path / "state" / "outbox" / "latest.json")
     experiment = _read_json(tmp_path / "state" / "experiments" / "latest.json")
     report = _read_json(runtime["report_path"])
+    report_index = _read_json(tmp_path / "state" / "outbox" / "report.index.json")
     control_summary = _read_json(tmp_path / "state" / "control_plane" / "current_summary.json")
 
     # Regression guard for #177: before the fix, the resolved decision from
@@ -432,6 +433,23 @@ def test_cycle_persists_recorded_feedback_decision_into_latest_authority_artifac
     assert experiment["feedback_decision"]["mode"] == "retire_terminal_selfevo_lane"
     assert report["feedback_decision"]["mode"] == "retire_terminal_selfevo_lane"
     assert control_summary["task_plan"]["feedback_decision"]["mode"] == "retire_terminal_selfevo_lane"
+
+    # Regression guard for #178: after a terminal self-evolution lane is retired,
+    # every current-task surface must point to the selected follow-up lane. The
+    # retired/pre-plan task is kept only as diagnostic feedback_decision context.
+    assert current["current_task_id"] == "record-reward"
+    assert outbox["current_task_id"] == "record-reward"
+    assert experiment["current_task_id"] == "record-reward"
+    assert report["current_task_id"] == "record-reward"
+    assert report_index["current_task_id"] == "record-reward"
+    assert control_summary["task_plan"]["current_task_id"] == "record-reward"
+    assert control_summary["task_boundary"]["task_id"] == "record-reward"
+    assert control_summary["experiment"]["current_task_id"] == "record-reward"
+    assert report["feedback_decision"]["current_task_id"] == "analyze-last-failed-candidate"
+    assert report["feedback_decision"]["selected_task_id"] == "record-reward"
+    assert outbox["selected_tasks"] == "Record cycle reward [task_id=record-reward]"
+    assert report["selected_tasks"] == "Record cycle reward [task_id=record-reward]"
+    assert report_index["selected_tasks"] == "Record cycle reward [task_id=record-reward]"
 
 
 def test_cycle_rotates_goal_after_repeated_same_goal_artifact_passes(tmp_path):
@@ -989,6 +1007,79 @@ def test_subagent_rollup_materializes_terminal_telemetry_for_matching_request(tm
     assert rollup["active_task_linkage"]["result_status"] == "done"
     assert rollup["active_task_linkage"]["source"] == "task_plan"
     assert rollup["latest_request"]["materialized_result_path"].endswith("terminal-result.json")
+
+
+def test_subagent_materializer_executes_research_only_request_with_local_executor(tmp_path):
+    from nanobot.runtime.subagent_materializer import materialize_subagent_requests
+
+    state_root = tmp_path / "state"
+    request_dir = state_root / "subagents" / "requests"
+    request_dir.mkdir(parents=True)
+    request_path = request_dir / "request-cycle-pi.json"
+    request_path.write_text(json.dumps({
+        "schema_version": "subagent-request-v1",
+        "request_status": "queued",
+        "task_id": "subagent-verify-materialized-improvement",
+        "cycle_id": "cycle-pi",
+        "profile": "research_only",
+        "task_title": "Verify materialized proof",
+        "source_artifact": "workspace/state/improvements/materialized-cycle-pi.json",
+    }), encoding="utf-8")
+
+    summary = materialize_subagent_requests(
+        state_root=state_root,
+        now=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc),
+        executor_command="python3 -c 'import sys; print(\"APPROVED:\" + sys.stdin.read()[:20])'",
+    )
+
+    assert summary["executed_count"] == 1
+    assert summary["blocked_result_count"] == 0
+    result = _read_json(Path(summary["results"][0]["path"]))
+    assert result["status"] == "completed"
+    assert result["result_status"] == "completed"
+    assert result["terminal_reason"] is None
+    assert result["executor"]["provider"] == "hermes_pi_qwen"
+    assert result["executor"]["model"] == "gpt-5.3-codex"
+    assert result["executor"]["base_url"] == "https://litellm.ayga.tech:9443/v1"
+    assert "sk-" not in json.dumps(result)
+    assert result["summary"].startswith("APPROVED:")
+
+    rollup = _subagent_rollup_snapshot(state_root=state_root, current_task_id="subagent-verify-materialized-improvement")
+    assert rollup["result_count"] == 1
+    assert rollup["blocked_result_count"] == 0
+    assert rollup["latest_result"]["status"] == "completed"
+
+
+def test_subagent_materializer_records_executor_failure_without_leaking_command_secrets(tmp_path):
+    from nanobot.runtime.subagent_materializer import materialize_subagent_requests
+
+    state_root = tmp_path / "state"
+    request_dir = state_root / "subagents" / "requests"
+    request_dir.mkdir(parents=True)
+    request_path = request_dir / "request-cycle-fail.json"
+    request_path.write_text(json.dumps({
+        "schema_version": "subagent-request-v1",
+        "request_status": "queued",
+        "task_id": "subagent-verify-materialized-improvement",
+        "cycle_id": "cycle-fail",
+        "profile": "research_only",
+    }), encoding="utf-8")
+
+    summary = materialize_subagent_requests(
+        state_root=state_root,
+        now=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc),
+        executor_command="python3 -c 'import sys; sys.stderr.write(\"bad sk-secret\"); raise SystemExit(7)'",
+    )
+
+    assert summary["executed_count"] == 0
+    assert summary["blocked_result_count"] == 1
+    result = _read_json(Path(summary["results"][0]["path"]))
+    assert result["status"] == "blocked"
+    assert result["terminal_reason"] == "local_executor_failed"
+    assert result["executor"]["base_url"] == "https://litellm.ayga.tech:9443/v1"
+    serialized = json.dumps(result)
+    assert "sk-secret" not in serialized
+    assert "python3 -c" not in serialized
 
 
 def test_subagent_materializer_terminalizes_queued_request_and_rollup_correlates_result(tmp_path):
