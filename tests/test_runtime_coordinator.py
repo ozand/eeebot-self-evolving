@@ -1082,6 +1082,86 @@ def test_subagent_materializer_records_executor_failure_without_leaking_command_
     assert "python3 -c" not in serialized
 
 
+def test_subagent_materializer_runs_executor_without_shell(tmp_path, monkeypatch):
+    import subprocess
+    from nanobot.runtime import subagent_materializer
+
+    state_root = tmp_path / "state"
+    request_dir = state_root / "subagents" / "requests"
+    request_dir.mkdir(parents=True)
+    (request_dir / "request-safe-argv.json").write_text(json.dumps({
+        "schema_version": "subagent-request-v1",
+        "request_status": "queued",
+        "task_id": "safe-argv",
+        "cycle_id": "cycle-safe-argv",
+        "profile": "research_only",
+    }), encoding="utf-8")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append({"argv": argv, **kwargs})
+        return subprocess.CompletedProcess(argv, 0, stdout="APPROVED safe argv", stderr="")
+
+    monkeypatch.setattr(subagent_materializer.subprocess, "run", fake_run)
+
+    summary = subagent_materializer.materialize_subagent_requests(
+        state_root=state_root,
+        now=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc),
+        executor_command=["python3", "-c", "print('safe'); touch /tmp/should-not-run"],
+    )
+
+    assert summary["executed_count"] == 1
+    assert calls
+    assert calls[0]["shell"] is False
+    assert isinstance(calls[0]["argv"], list)
+    assert calls[0]["argv"][2] == "print('safe'); touch /tmp/should-not-run"
+
+
+def test_subagent_materializer_pi_dev_executor_uses_public_json_argv(tmp_path, monkeypatch):
+    import subprocess
+    from nanobot.runtime import subagent_materializer
+
+    state_root = tmp_path / "state"
+    request_dir = state_root / "subagents" / "requests"
+    request_dir.mkdir(parents=True)
+    (request_dir / "request-pi-dev.json").write_text(json.dumps({
+        "schema_version": "subagent-request-v1",
+        "request_status": "queued",
+        "task_id": "pi-dev-public-route",
+        "cycle_id": "cycle-pi-dev",
+        "profile": "research_only",
+    }), encoding="utf-8")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append({"argv": argv, **kwargs})
+        return subprocess.CompletedProcess(argv, 0, stdout="{\"response\":\"APPROVED pi route\"}", stderr="")
+
+    monkeypatch.setattr(subagent_materializer.subprocess, "run", fake_run)
+    monkeypatch.setenv("NANOBOT_SUBAGENT_EXECUTOR", "pi_dev")
+    monkeypatch.delenv("NANOBOT_SUBAGENT_EXECUTOR_COMMAND", raising=False)
+
+    summary = subagent_materializer.materialize_subagent_requests(
+        state_root=state_root,
+        now=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc),
+    )
+
+    assert summary["executed_count"] == 1
+    argv = calls[0]["argv"]
+    assert calls[0]["shell"] is False
+    assert argv[0].endswith("/pi") or argv[0] == "pi"
+    assert "--mode" in argv
+    assert "json" in argv
+    assert "-p" in argv
+    assert "--no-session" in argv
+    assert "--no-tools" in argv
+    assert argv[argv.index("--provider") + 1] == "hermes_pi_qwen"
+    assert argv[argv.index("--model") + 1] == "gpt-5.3-codex"
+    result = _read_json(Path(summary["results"][0]["path"]))
+    assert result["executor"]["base_url"] == "https://litellm.ayga.tech:9443/v1"
+    assert "coder-model" not in json.dumps(result)
+
+
 def test_subagent_materializer_terminalizes_queued_request_and_rollup_correlates_result(tmp_path):
     from nanobot.runtime.subagent_materializer import materialize_subagent_requests
 

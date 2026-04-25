@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,10 +14,20 @@ from typing import Any
 PI_DEV_PROVIDER = "hermes_pi_qwen"
 PI_DEV_MODEL = "gpt-5.3-codex"
 PI_DEV_PUBLIC_BASE_URL = "https://litellm.ayga.tech:9443/v1"
-PI_DEV_COMMAND = (
-    'env PATH="$HOME/.hermes/node/bin:$PATH" '
-    f'pi --provider {PI_DEV_PROVIDER} --model {PI_DEV_MODEL} -p --no-session --no-tools'
-)
+PI_DEV_BIN = os.path.expanduser("~/.hermes/node/bin/pi")
+PI_DEV_COMMAND_ARGV = [
+    PI_DEV_BIN if Path(PI_DEV_BIN).exists() else "pi",
+    "--mode",
+    "json",
+    "-p",
+    "--no-session",
+    "--no-tools",
+    "--provider",
+    PI_DEV_PROVIDER,
+    "--model",
+    PI_DEV_MODEL,
+]
+PI_DEV_COMMAND = " ".join(shlex.quote(part) for part in PI_DEV_COMMAND_ARGV)
 
 
 def _safe_read_json(path: Path) -> dict[str, Any] | None:
@@ -69,13 +80,20 @@ def _request_prompt(request: dict[str, Any]) -> str:
     )
 
 
-def _run_local_executor(command: str, request: dict[str, Any], *, timeout_seconds: int) -> tuple[bool, dict[str, Any]]:
+def _executor_argv(command: str | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(command, (list, tuple)):
+        return [str(part) for part in command]
+    return shlex.split(str(command))
+
+
+def _run_local_executor(command: str | list[str] | tuple[str, ...], request: dict[str, Any], *, timeout_seconds: int) -> tuple[bool, dict[str, Any]]:
+    argv = _executor_argv(command)
     try:
         completed = subprocess.run(
-            command,
+            argv,
             input=_request_prompt(request),
             text=True,
-            shell=True,
+            shell=False,
             capture_output=True,
             timeout=timeout_seconds,
             check=False,
@@ -105,7 +123,7 @@ def _run_local_executor(command: str, request: dict[str, Any], *, timeout_second
     return completed.returncode == 0, payload
 
 
-def materialize_subagent_requests(*, state_root: Path, now: datetime | None = None, limit: int | None = None, executor_command: str | None = None, executor_timeout_seconds: int = 120) -> dict[str, Any]:
+def materialize_subagent_requests(*, state_root: Path, now: datetime | None = None, limit: int | None = None, executor_command: str | list[str] | tuple[str, ...] | None = None, executor_timeout_seconds: int = 120) -> dict[str, Any]:
     """Terminalize queued subagent requests into durable result artifacts.
 
     The local product runtime does not assume a live external subagent executor is
@@ -137,9 +155,9 @@ def materialize_subagent_requests(*, state_root: Path, now: datetime | None = No
     blocked = 0
     executed = 0
     skipped = 0
-    configured_executor = executor_command or os.environ.get("NANOBOT_SUBAGENT_EXECUTOR_COMMAND")
+    configured_executor: str | list[str] | tuple[str, ...] | None = executor_command or os.environ.get("NANOBOT_SUBAGENT_EXECUTOR_COMMAND")
     if not configured_executor and os.environ.get("NANOBOT_SUBAGENT_EXECUTOR") == "pi_dev":
-        configured_executor = PI_DEV_COMMAND
+        configured_executor = PI_DEV_COMMAND_ARGV
     if request_dir.exists():
         request_paths = sorted([p for p in request_dir.glob("*.json") if p.is_file()], key=lambda p: p.stat().st_mtime)
         for request_path in request_paths:
