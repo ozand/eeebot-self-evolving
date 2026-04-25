@@ -253,6 +253,8 @@ def test_cycle_writes_pass_report_when_gate_is_fresh(tmp_path):
     assert candidate["promotion_candidate_id"] == report["promotion_candidate_id"]
     assert candidate["origin_cycle_id"] == report["cycle_id"]
     assert candidate["target_branch"] == "promote/self-evolving"
+    assert candidate["promotion_provenance"]["source_commit"]
+    assert candidate["promotion_provenance"]["deployment_fingerprint"]["deployment_fingerprint_id"].startswith(report["promotion_candidate_id"])
     assert candidate["evidence_refs"] == [report["evidence_ref_id"]]
 
     current = _read_json(tmp_path / "state" / "goals" / "current.json")
@@ -1024,6 +1026,8 @@ def test_load_runtime_state_prefers_materialized_subagent_results_over_stale_out
     assert runtime["subagent_rollup"]["state"] == "completed"
     assert runtime["subagent_rollup"]["result_count"] == 1
     assert runtime["subagent_rollup"]["stale_request_count"] == 0
+    assert runtime["subagent_rollup"]["latest_request"]["status"] == "blocked"
+    assert runtime["subagent_rollup"]["latest_request"]["materialized_result_status"] == "blocked"
 
 
 def test_material_progress_does_not_treat_blocked_subagent_terminalization_as_healthy():
