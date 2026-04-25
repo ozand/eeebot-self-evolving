@@ -788,16 +788,20 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         reasons.append('live_feedback_decision_missing')
     local_task = repo_plan.get('current_task_id') or repo_plan.get('current_task')
     live_task = eeepc_plan.get('current_task_id') or eeepc_plan.get('current_task') or eeepc_plan.get('selected_tasks_text') or eeepc_plan.get('selected_tasks')
-    if local_task and live_task and str(local_task) not in str(live_task):
-        reasons.append('current_task_drift')
-    missing = [key for key, present in artifacts.items() if not present]
-    if missing:
-        reasons.append('live_hadi_artifacts_missing')
-    legacy = (
+    live_is_legacy_reward = (
         eeepc_plan.get('task_selection_source') == 'recorded_current_task'
         and 'record-reward' in str(live_task or '')
         and not live_feedback
-    ) or (not live_feedback and 'record-reward' in str(live_task or '') and bool(missing))
+    )
+    if local_task and live_task and str(local_task) not in str(live_task):
+        if live_is_legacy_reward:
+            reasons.append('legacy_live_reward_loop_current_task')
+        else:
+            reasons.append('current_task_drift')
+    missing = [key for key, present in artifacts.items() if not present]
+    if missing:
+        reasons.append('live_hadi_artifacts_missing')
+    legacy = live_is_legacy_reward or (not live_feedback and 'record-reward' in str(live_task or '') and bool(missing))
     return {
         'schema_version': 'runtime-parity-v1',
         'state': 'legacy_reward_loop' if legacy else ('healthy' if not reasons else 'degraded'),
@@ -805,6 +809,7 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         'missing_live_artifacts': missing,
         'local_current_task_id': local_task,
         'live_current_task_id': live_task,
+        'canonical_current_task_id': local_task or live_task,
         'live_task_selection_source': eeepc_plan.get('task_selection_source'),
     }
 
@@ -1453,8 +1458,10 @@ def _plan_snapshot_from_row(row) -> dict:
             if isinstance(nested, dict):
                 plan_payload_source = plan_payload_source or key
                 item.update(nested)
+    if not _has_value(item.get('current_task_id')):
+        item['current_task_id'] = _first_present(item, ('current_task_id', 'currentTaskId', 'task_id', 'taskId'))
     if not _has_value(item.get('current_task')):
-        item['current_task'] = _first_present(item, ('current_task', 'current_task_id', 'selected_task_title', 'selected_task_label'))
+        item['current_task'] = _first_present(item, ('current_task', 'currentTask', 'current_task_id', 'currentTaskId', 'selected_task_title', 'selected_task_label'))
     task_list = _json_loads_any(item.get('task_list_json'))
     if isinstance(task_list, list):
         item['task_list'] = task_list
@@ -1602,6 +1609,7 @@ def _plan_snapshot_from_row(row) -> dict:
         'collected_at': item.get('collected_at'),
         'source': item.get('source'),
         'status': item.get('status'),
+        'current_task_id': item.get('current_task_id'),
         'current_task': item.get('current_task'),
         'task_list': item.get('task_list') or [],
         'task_count': len(item.get('task_list') or []),
@@ -2293,10 +2301,15 @@ def create_app(cfg: DashboardConfig):
             producer_plan = ((control_plane.get('producer_summary') or {}).get('task_plan') if isinstance(control_plane, dict) and isinstance(control_plane.get('producer_summary'), dict) else None) or {}
             producer_feedback = producer_plan.get('feedback_decision') if isinstance(producer_plan.get('feedback_decision'), dict) else {}
             material_progress = _material_progress_summary(control_plane.get('material_progress') if isinstance(control_plane, dict) else None)
+            task_truth = _task_plan_truth(producer_plan)
+            canonical_current_task_id = (plan_latest.get('current_task_id') if plan_latest else None) or task_truth.get('current_task_id')
+            canonical_current_task = (plan_latest.get('current_task') if plan_latest and plan_latest.get('current_task') else task_truth.get('current_task'))
             payload = {
                 'current_plan': plan_latest,
                 'current_plan_source': plan_latest['source'] if plan_latest else None,
-                'current_task': (plan_latest['current_task'] if plan_latest and plan_latest.get('current_task') else producer_plan.get('current_task') or producer_plan.get('current_task_id')),
+                'current_task_id': canonical_current_task_id,
+                'current_task': canonical_current_task,
+                'task_plan': task_truth['task_plan'],
                 'selected_task_title': (plan_latest['selected_task_title'] if plan_latest and plan_latest.get('selected_task_title') else producer_feedback.get('selected_task_title') or producer_feedback.get('selected_task_label')),
                 'feedback_decision': (plan_latest['feedback_decision'] if plan_latest and plan_latest.get('feedback_decision') else producer_plan.get('feedback_decision')),
                 'task_selection_source': (plan_latest['task_selection_source'] if plan_latest and plan_latest.get('task_selection_source') else producer_plan.get('task_selection_source') or producer_feedback.get('selection_source')),
