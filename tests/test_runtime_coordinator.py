@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nanobot.runtime.state import _subagent_rollup_snapshot, format_runtime_state, load_runtime_state, load_runtime_state_from_root, resolve_runtime_state_location
+from nanobot.runtime.state import _material_progress_snapshot, _subagent_rollup_snapshot, format_runtime_state, load_runtime_state, load_runtime_state_from_root, resolve_runtime_state_location
 from nanobot.runtime.coordinator import run_self_evolving_cycle
 
 
@@ -917,3 +917,142 @@ def test_subagent_rollup_materializes_terminal_telemetry_for_matching_request(tm
     assert rollup["active_task_linkage"]["result_status"] == "done"
     assert rollup["active_task_linkage"]["source"] == "task_plan"
     assert rollup["latest_request"]["materialized_result_path"].endswith("terminal-result.json")
+
+
+def test_subagent_materializer_terminalizes_queued_request_and_rollup_correlates_result(tmp_path):
+    from nanobot.runtime.subagent_materializer import materialize_subagent_requests
+
+    state_root = tmp_path / "state"
+    request_dir = state_root / "subagents" / "requests"
+    request_dir.mkdir(parents=True)
+    request_path = request_dir / "request-cycle-old.json"
+    request_path.write_text(json.dumps({
+        "schema_version": "subagent-request-v1",
+        "request_status": "queued",
+        "task_id": "subagent-verify-materialized-improvement",
+        "cycle_id": "cycle-old",
+        "profile": "research_only",
+        "source_artifact": "workspace/state/improvements/materialized-cycle-old.json",
+    }), encoding="utf-8")
+    old = datetime.now(timezone.utc) - timedelta(hours=3)
+    import os
+    os.utime(request_path, (old.timestamp(), old.timestamp()))
+
+    summary = materialize_subagent_requests(state_root=state_root, now=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc))
+
+    assert summary["terminalized_count"] == 1
+    assert summary["blocked_result_count"] == 1
+    result_path = Path(summary["results"][0]["path"])
+    result = _read_json(result_path)
+    assert result["schema_version"] == "subagent-result-v1"
+    assert result["request_path"] == str(request_path)
+    assert result["task_id"] == "subagent-verify-materialized-improvement"
+    assert result["status"] == "blocked"
+    assert result["terminal_reason"] == "local_executor_unavailable"
+
+    rollup = _subagent_rollup_snapshot(state_root=state_root, current_task_id="subagent-verify-materialized-improvement")
+    assert rollup["result_count"] == 1
+    assert rollup["blocked_result_count"] == 1
+    assert rollup["stale_request_count"] == 0
+    assert rollup["latest_request"]["materialized_result_path"] == str(result_path)
+
+
+def test_material_progress_rejects_stale_historic_proofs_for_discarded_current_cycle():
+    runtime = {
+        "current_task_id": "inspect-pass-streak",
+        "experiment": {
+            "outcome": "discard",
+            "decision": "pending_policy_review",
+            "review_status": "pending_policy_review",
+            "revert_status": "skipped_no_material_change",
+        },
+        "selfevo_current_state": {
+            "last_merge": {"pr_number": 28, "merged": True},
+            "last_issue_lifecycle": {"issue_number": 27, "pr_number": 28, "status": "terminal_merged"},
+        },
+        "promotion_artifact_path": "/workspace/state/improvements/materialized-cycle-old.json",
+        "subagent_rollup": {"state": "stale", "completed_result_count": 0, "latest_result": None, "active_task_id": "inspect-pass-streak"},
+    }
+
+    progress = _material_progress_snapshot(runtime)
+
+    assert progress["state"] == "blocked"
+    assert progress["healthy_autonomy_allowed"] is False
+    assert progress["blocking_reason"] == "missing_current_material_progress"
+    assert "historic_or_unlinked_selfevo_pr" in progress["non_qualifying_proofs"]
+    assert "historic_or_unaccepted_promotion_artifact" in progress["non_qualifying_proofs"]
+
+
+def test_subagent_rollup_counts_distinct_result_artifacts_for_same_task(tmp_path):
+    state_root = tmp_path / "state"
+    request_dir = state_root / "subagents" / "requests"
+    result_dir = state_root / "subagents" / "results"
+    request_dir.mkdir(parents=True)
+    result_dir.mkdir(parents=True)
+    for idx in range(2):
+        request_path = request_dir / f"request-cycle-{idx}.json"
+        request_path.write_text(json.dumps({"task_id": "same-task", "cycle_id": f"cycle-{idx}", "request_status": "queued"}), encoding="utf-8")
+        result_path = result_dir / f"result-cycle-{idx}.json"
+        result_path.write_text(json.dumps({"schema_version": "subagent-result-v1", "status": "blocked", "task_id": "same-task", "cycle_id": f"cycle-{idx}", "request_path": str(request_path)}), encoding="utf-8")
+
+    rollup = _subagent_rollup_snapshot(state_root=state_root, current_task_id="same-task")
+
+    assert rollup["result_count"] == 2
+    assert rollup["blocked_result_count"] == 2
+    assert rollup["stale_request_count"] == 0
+    assert all(request["materialized_result_path"] for request in [rollup["latest_request"]])
+
+
+def test_load_runtime_state_prefers_materialized_subagent_results_over_stale_outbox_rollup(tmp_path):
+    state_root = tmp_path / "state"
+    reports_dir = state_root / "reports"
+    outbox_dir = state_root / "outbox"
+    goals_dir = state_root / "goals"
+    request_dir = state_root / "subagents" / "requests"
+    result_dir = state_root / "subagents" / "results"
+    for directory in (reports_dir, outbox_dir, goals_dir, request_dir, result_dir):
+        directory.mkdir(parents=True)
+    (goals_dir / "current.json").write_text(json.dumps({"current_task_id": "same-task", "current_task": "same-task"}), encoding="utf-8")
+    (reports_dir / "evolution-latest.json").write_text(json.dumps({"cycle_id": "cycle-1", "current_task_id": "same-task", "result_status": "PASS"}), encoding="utf-8")
+    (outbox_dir / "latest.json").write_text(json.dumps({"goal_context": {"subagent_rollup": {"state": "stale", "completed_result_count": 0, "stale_request_count": 2}}}), encoding="utf-8")
+    request_path = request_dir / "request-cycle-1.json"
+    request_path.write_text(json.dumps({"task_id": "same-task", "cycle_id": "cycle-1", "request_status": "queued"}), encoding="utf-8")
+    (result_dir / "result-cycle-1.json").write_text(json.dumps({"schema_version": "subagent-result-v1", "status": "blocked", "task_id": "same-task", "cycle_id": "cycle-1", "request_path": str(request_path)}), encoding="utf-8")
+
+    runtime = load_runtime_state_from_root(state_root)
+
+    assert runtime["subagent_rollup"]["state"] == "completed"
+    assert runtime["subagent_rollup"]["result_count"] == 1
+    assert runtime["subagent_rollup"]["stale_request_count"] == 0
+
+
+def test_material_progress_does_not_treat_blocked_subagent_terminalization_as_healthy():
+    runtime = {
+        "current_task_id": "inspect-pass-streak",
+        "experiment": {
+            "outcome": "discard",
+            "decision": "pending_policy_review",
+            "review_status": "pending_policy_review",
+            "revert_status": "skipped_no_material_change",
+        },
+        "subagent_rollup": {
+            "state": "completed",
+            "completed_result_count": 1,
+            "blocked_result_count": 1,
+            "latest_result": {
+                "path": "/workspace/state/subagents/results/result-cycle-1.json",
+                "status": "blocked",
+                "summary": "Subagent request terminalized as blocked because no local executor is available",
+            },
+            "active_task_id": "inspect-pass-streak",
+        },
+    }
+
+    progress = _material_progress_snapshot(runtime)
+
+    consumed = next(proof for proof in progress["proofs"] if proof["kind"] == "consumed_subagent_result")
+    assert consumed["present"] is False
+    assert consumed["reason"] == "subagent_result_blocked"
+    assert progress["state"] == "blocked"
+    assert progress["healthy_autonomy_allowed"] is False
+    assert progress["blocking_reason"] == "missing_current_material_progress"
