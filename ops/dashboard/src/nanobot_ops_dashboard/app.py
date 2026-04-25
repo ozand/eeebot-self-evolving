@@ -842,16 +842,46 @@ def _autonomy_verdict(*, analytics: dict, plan_latest: dict | None, experiment_v
     if latest_noop.get('status') == 'terminal_noop':
         reasons.append('terminal_noop')
     material_progress = material_progress if isinstance(material_progress, dict) else {}
-    if material_progress and not material_progress.get('healthy_autonomy_allowed'):
+    material_allows_healthy = bool(material_progress.get('healthy_autonomy_allowed'))
+    if material_progress and not material_allows_healthy:
         reasons.append('material_progress_missing')
     runtime_parity = runtime_parity if isinstance(runtime_parity, dict) else {}
-    if runtime_parity.get('state') in {'legacy_reward_loop', 'degraded', 'unknown'}:
+    runtime_reasons = runtime_parity.get('reasons') if isinstance(runtime_parity.get('reasons'), list) else []
+    runtime_tasks_aligned = (
+        _has_value(runtime_parity.get('local_current_task_id'))
+        and runtime_parity.get('local_current_task_id') == runtime_parity.get('live_current_task_id')
+    )
+    runtime_has_canonical_authority = _has_value(runtime_parity.get('canonical_current_task_id'))
+    runtime_parity_is_blocking = runtime_parity.get('state') in {'legacy_reward_loop', 'degraded', 'unknown'}
+    downgradeable_runtime_reasons = {'live_feedback_decision_missing', 'legacy_live_reward_loop_current_task'}
+    runtime_has_only_historical_reasons = set(str(reason) for reason in runtime_reasons).issubset(downgradeable_runtime_reasons)
+    runtime_can_be_historical = (
+        material_allows_healthy
+        and runtime_has_canonical_authority
+        and 'current_task_drift' not in runtime_reasons
+        and runtime_has_only_historical_reasons
+        and (runtime_tasks_aligned or 'legacy_live_reward_loop_current_task' in runtime_reasons)
+    )
+    if runtime_parity_is_blocking and not runtime_can_be_historical:
         reasons.append('runtime_parity_blocked')
-    status = 'healthy_progress' if material_progress.get('healthy_autonomy_allowed') and not reasons else ('stagnant' if any(reason in reasons for reason in {'same_task_streak', 'discarded_experiment', 'terminal_noop', 'material_progress_missing', 'runtime_parity_blocked'}) else 'healthy')
+    historical_reasons: list[str] = []
+    if material_allows_healthy:
+        stale_after_material_progress = {'same_task_streak', 'discarded_experiment', 'suppressed_reward', 'terminal_noop'}
+        blocking_reasons = []
+        for reason in reasons:
+            if reason in stale_after_material_progress:
+                historical_reasons.append(reason)
+            else:
+                blocking_reasons.append(reason)
+        if runtime_parity_is_blocking and runtime_can_be_historical:
+            historical_reasons.append('runtime_parity_blocked')
+        reasons = blocking_reasons
+    status = 'healthy_progress' if material_allows_healthy and not reasons else ('stagnant' if any(reason in reasons for reason in {'same_task_streak', 'discarded_experiment', 'terminal_noop', 'material_progress_missing', 'runtime_parity_blocked'}) else 'healthy')
     return {
         'schema_version': 'autonomy-verdict-v1',
         'state': status,
         'reasons': reasons,
+        'historical_reasons': historical_reasons,
         'current_task_id': (plan_latest or {}).get('current_task_id') or (plan_latest or {}).get('current_task'),
         'pass_streak': analytics.get('current_streak'),
         'material_progress': material_progress or None,
@@ -2327,8 +2357,8 @@ def create_app(cfg: DashboardConfig):
             producer_feedback = producer_plan.get('feedback_decision') if isinstance(producer_plan.get('feedback_decision'), dict) else {}
             material_progress = _material_progress_summary(control_plane.get('material_progress') if isinstance(control_plane, dict) else None)
             task_truth = _task_plan_truth(producer_plan)
-            canonical_current_task_id = (plan_latest.get('current_task_id') if plan_latest else None) or task_truth.get('current_task_id')
-            canonical_current_task = (plan_latest.get('current_task') if plan_latest and plan_latest.get('current_task') else task_truth.get('current_task'))
+            canonical_current_task_id = task_truth.get('current_task_id') or (plan_latest.get('current_task_id') if plan_latest else None)
+            canonical_current_task = task_truth.get('current_task') or (plan_latest.get('current_task') if plan_latest and plan_latest.get('current_task') else None)
             canonical_task_plan = dict(task_truth['task_plan'])
             if _has_value(canonical_current_task_id) and not _has_value(canonical_task_plan.get('current_task_id')):
                 canonical_task_plan['current_task_id'] = canonical_current_task_id
