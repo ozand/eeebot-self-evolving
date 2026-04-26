@@ -36,11 +36,11 @@ def test_preflight_reports_blocked_privileged_access_with_latest_readable_report
             return subprocess.CompletedProcess(args, 0, 'debian\nozand\nuid=1000(ozand)\n', '')
         if command == 'sudo -n true':
             return subprocess.CompletedProcess(args, 1, '', 'sudo: a password is required\n')
-        if command.startswith('test -x /home/opencode/.venvs/nanobot/bin/nanobot'):
+        if command.startswith('test -x '):
             return subprocess.CompletedProcess(args, 1, '', '')
-        if command.endswith('/outbox/report.index.json'):
+        if 'outbox/report.index.json' in command:
             return subprocess.CompletedProcess(args, 1, '', '')
-        if command.endswith('/goals/registry.json'):
+        if 'goals/registry.json' in command:
             return subprocess.CompletedProcess(args, 1, '', '')
         if '/reports/evolution-*.json' in command:
             return subprocess.CompletedProcess(args, 0, latest_report + '\n', '')
@@ -82,3 +82,81 @@ def test_preflight_main_always_exits_zero_for_auditable_blocked_state(monkeypatc
     assert module.main(['--host', 'eeepc', '--ssh-key', '/tmp/key', '--json']) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload['state'] == 'blocked_privileged_access'
+
+
+def test_preflight_reports_ready_when_all_privileged_checks_pass(monkeypatch):
+    module = _load_module()
+    state_root = '/var/lib/eeepc-agent/self-evolving-agent/state'
+    latest_report = f'{state_root}/reports/evolution-ready.json'
+    report_payload = {'result_status': 'PASS', 'goal_id': 'goal-bootstrap', 'feedback_decision': {'selected_task_id': 'task-1'}}
+
+    def fake_run(args, timeout=20):
+        command = args[-1]
+        if command in {'hostname; whoami; id', 'sudo -n true'}:
+            return subprocess.CompletedProcess(args, 0, 'ok\n', '')
+        if command.startswith('test -x ') or command.startswith('test -r '):
+            return subprocess.CompletedProcess(args, 0, '', '')
+        if '/reports/evolution-*.json' in command:
+            return subprocess.CompletedProcess(args, 0, latest_report + '\n', '')
+        if command == f'cat {latest_report}':
+            return subprocess.CompletedProcess(args, 0, json.dumps(report_payload), '')
+        raise AssertionError(command)
+
+    monkeypatch.setattr(module, 'run_command', fake_run)
+
+    payload = module.build_preflight(host='eeepc', state_root=state_root, key='/tmp/key')
+
+    assert payload['state'] == 'ready'
+    assert payload['ready'] is True
+    assert payload['blocked_capabilities'] == []
+    assert payload['latest_report']['feedback_decision_present'] is True
+
+
+def test_preflight_reports_blocked_unreachable_without_running_privileged_checks(monkeypatch):
+    module = _load_module()
+    commands = []
+
+    def fake_run(args, timeout=20):
+        commands.append(args[-1])
+        return subprocess.CompletedProcess(args, 255, '', 'host unreachable')
+
+    monkeypatch.setattr(module, 'run_command', fake_run)
+
+    payload = module.build_preflight(host='eeepc', state_root='/state', key='/tmp/key')
+
+    assert payload['state'] == 'blocked_unreachable'
+    assert payload['ready'] is False
+    assert payload['blocked_capabilities'] == ['ssh_reachability']
+    assert commands == ['hostname; whoami; id']
+
+
+def test_preflight_quotes_user_supplied_remote_paths(monkeypatch):
+    module = _load_module()
+    commands = []
+    injected_state_root = "/state; touch /tmp/SHOULD_NOT_EXIST"
+    injected_nanobot = "/bin/nanobot; touch /tmp/SHOULD_NOT_EXIST"
+    injected_home = "/home/opencode; touch /tmp/SHOULD_NOT_EXIST"
+
+    def fake_run(args, timeout=20):
+        command = args[-1]
+        commands.append(command)
+        if command == 'hostname; whoami; id':
+            return subprocess.CompletedProcess(args, 0, 'ok\n', '')
+        return subprocess.CompletedProcess(args, 1, '', '')
+
+    monkeypatch.setattr(module, 'run_command', fake_run)
+
+    module.build_preflight(
+        host='eeepc',
+        state_root=injected_state_root,
+        key='/tmp/key',
+        nanobot_path=injected_nanobot,
+        opencode_home=injected_home,
+    )
+
+    joined = '\n'.join(commands)
+    assert "'/state; touch /tmp/SHOULD_NOT_EXIST'" in joined
+    assert "'/bin/nanobot; touch /tmp/SHOULD_NOT_EXIST'" in joined
+    assert "'/home/opencode; touch /tmp/SHOULD_NOT_EXIST'" in joined
+    assert 'test -r /state; touch /tmp/SHOULD_NOT_EXIST' not in joined
+    assert 'test -x /bin/nanobot; touch /tmp/SHOULD_NOT_EXIST' not in joined
