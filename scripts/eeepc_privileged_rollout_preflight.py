@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -26,6 +27,10 @@ def _ssh_args(host: str, remote_command: str, *, key: str | None = None) -> list
     return args
 
 
+def _quote(value: str) -> str:
+    return shlex.quote(value)
+
+
 def _ssh(host: str, remote_command: str, *, key: str | None = None, timeout: int = 20) -> dict[str, Any]:
     proc = run_command(_ssh_args(host, remote_command, key=key), timeout=timeout)
     return {
@@ -38,11 +43,12 @@ def _ssh(host: str, remote_command: str, *, key: str | None = None, timeout: int
 
 
 def _read_latest_report(host: str, state_root: str, *, key: str | None = None) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
-    path_result = _ssh(host, f"sh -lc 'ls -1t {state_root}/reports/evolution-*.json 2>/dev/null | head -n 1'", key=key)
+    reports_glob = f"{_quote(state_root)}/reports/evolution-*.json"
+    path_result = _ssh(host, f"sh -lc {_quote(f'ls -1t {reports_glob} 2>/dev/null | head -n 1')}", key=key)
     report_path = path_result["stdout"].splitlines()[0] if path_result["ok"] and path_result["stdout"] else None
     if not report_path:
         return None, None, path_result
-    cat_result = _ssh(host, f"cat {report_path}", key=key)
+    cat_result = _ssh(host, f"cat {_quote(report_path)}", key=key)
     if not cat_result["ok"]:
         return report_path, None, cat_result
     try:
@@ -71,9 +77,9 @@ def build_preflight(*, host: str, state_root: str = DEFAULT_STATE_ROOT, key: str
         }
 
     sudo = _ssh(host, "sudo -n true", key=key)
-    opencode_home_check = _ssh(host, f"test -x {nanobot_path} && test -x {opencode_home}", key=key)
-    outbox = _ssh(host, f"test -r {state_root}/outbox/report.index.json", key=key)
-    goals = _ssh(host, f"test -r {state_root}/goals/registry.json", key=key)
+    opencode_home_check = _ssh(host, f"test -x {_quote(nanobot_path)} && test -x {_quote(opencode_home)}", key=key)
+    outbox = _ssh(host, f"test -r {_quote(state_root + '/outbox/report.index.json')}", key=key)
+    goals = _ssh(host, f"test -r {_quote(state_root + '/goals/registry.json')}", key=key)
     checks.update({
         "sudo_noninteractive": sudo,
         "opencode_nanobot_executable": opencode_home_check,
