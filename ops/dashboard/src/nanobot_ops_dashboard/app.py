@@ -874,9 +874,20 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
     )
     live_hadi_handoff_selected_task = live_feedback.get('selected_task_id') if isinstance(live_feedback, dict) else None
     live_hadi_handoff = (
-        isinstance(live_feedback, dict)
+        all(artifacts.values())
+        and isinstance(live_feedback, dict)
         and live_feedback.get('mode') in {'handoff_to_next_candidate', 'promote_review_followup', 'feedback_post_completion_handoff'}
         and live_feedback.get('selection_source') in {'feedback_post_completion_handoff', 'feedback_review_to_execution'}
+        and _has_value(live_hadi_handoff_selected_task)
+        and str(live_hadi_handoff_selected_task) == str(live_task)
+    )
+    live_pass_streak_switch = (
+        all(artifacts.values())
+        and isinstance(live_feedback, dict)
+        and live_feedback.get('mode') == 'retire_goal_artifact_pair'
+        and live_feedback.get('retire_goal_artifact_pair') is True
+        and live_feedback.get('current_task_id') == 'record-reward'
+        and live_feedback.get('selection_source') == 'feedback_pass_streak_switch'
         and _has_value(live_hadi_handoff_selected_task)
         and str(live_hadi_handoff_selected_task) == str(live_task)
     )
@@ -887,6 +898,9 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
             reasons.append('legacy_live_reward_loop_current_task')
         elif live_hadi_handoff:
             authority_resolution = 'fresh_live_hadi_handoff'
+            canonical_task = live_task
+        elif live_pass_streak_switch:
+            authority_resolution = 'fresh_live_pass_streak_switch'
             canonical_task = live_task
         else:
             reasons.append('current_task_drift')
