@@ -921,6 +921,33 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
     }
 
 
+def _strong_reflection_freshness(cfg: DashboardConfig, now: datetime) -> dict:
+    path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'strong_reflection' / 'latest.json'
+    payload = _json_file(path)
+    if not payload:
+        return {
+            'schema_version': 'strong-reflection-freshness-v1',
+            'state': 'missing',
+            'available': False,
+            'path': str(path),
+            'reason': 'strong_reflection_latest_missing',
+        }
+    recorded_at = payload.get('recorded_at_utc')
+    ts = _parse_timestamp(recorded_at) if recorded_at else None
+    age = max(0, int((now.astimezone(timezone.utc) - ts).total_seconds())) if ts is not None else None
+    state = 'fresh' if isinstance(age, int) and age <= 8 * 3600 else 'stale'
+    return {
+        'schema_version': 'strong-reflection-freshness-v1',
+        'state': state,
+        'available': True,
+        'path': str(path),
+        'recorded_at_utc': recorded_at,
+        'age_seconds': age,
+        'summary': payload.get('summary'),
+        'mode': payload.get('mode'),
+    }
+
+
 def _ambition_utilization_verdict(*, analytics: dict, experiment_visibility: dict, subagent_visibility: dict | None = None) -> dict:
     """Classify whether recent autonomous activity is substantive or shallow.
 
@@ -1043,8 +1070,6 @@ def _autonomy_verdict(*, analytics: dict, plan_latest: dict | None, experiment_v
     if runtime_parity_is_blocking and not runtime_can_be_historical:
         reasons.append('runtime_parity_blocked')
     ambition_utilization = ambition_utilization if isinstance(ambition_utilization, dict) else {}
-    if ambition_utilization.get('state') == 'underutilized':
-        reasons.append('ambition_underutilized')
     historical_reasons: list[str] = []
     if material_allows_healthy:
         stale_after_material_progress = {'same_task_streak', 'discarded_experiment', 'suppressed_reward', 'terminal_noop'}
@@ -2331,6 +2356,14 @@ def create_app(cfg: DashboardConfig):
                     'title': summary.get('goal_id') or 'unknown',
                     'artifact': summary.get('report_path'),
                 }]
+        ambition_utilization = _ambition_utilization_verdict(
+            analytics=analytics,
+            experiment_visibility=experiment_visibility,
+            subagent_visibility=subagent_visibility,
+        )
+        strong_reflection_freshness = _strong_reflection_freshness(cfg, now)
+        analytics['ambition_utilization'] = ambition_utilization
+        analytics['strong_reflection_freshness'] = strong_reflection_freshness
         autonomy_verdict = _autonomy_verdict(
             analytics=analytics,
             plan_latest=plan_latest,
@@ -2339,6 +2372,7 @@ def create_app(cfg: DashboardConfig):
             cfg=cfg,
             material_progress=control_plane.get('material_progress') if isinstance(control_plane, dict) else None,
             runtime_parity=runtime_parity,
+            ambition_utilization=ambition_utilization,
         )
         analytics['runtime_parity'] = runtime_parity
         analytics['autonomy_verdict'] = autonomy_verdict
@@ -2346,6 +2380,8 @@ def create_app(cfg: DashboardConfig):
             control_plane = dict(control_plane)
             control_plane['material_progress'] = _material_progress_summary(control_plane.get('material_progress'))
             control_plane['runtime_parity'] = runtime_parity
+            control_plane['ambition_utilization'] = ambition_utilization
+            control_plane['strong_reflection_freshness'] = strong_reflection_freshness
             control_plane['autonomy_verdict'] = autonomy_verdict
 
         request_source = query.get('source', [''])[0]
@@ -2388,6 +2424,8 @@ def create_app(cfg: DashboardConfig):
             'current_budget': experiment_visibility['current_budget'],
             'current_reward_signal': experiment_visibility['current_reward_signal'],
             'current_reward_text': experiment_visibility['current_reward_text'],
+            'ambition_utilization': ambition_utilization,
+            'strong_reflection_freshness': strong_reflection_freshness,
             'credits_visibility': credits_visibility,
             'current_credits': credits_visibility['current'],
             'credits_history': credits_visibility['history'],
