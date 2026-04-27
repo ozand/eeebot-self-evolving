@@ -891,6 +891,22 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         and _has_value(live_hadi_handoff_selected_task)
         and str(live_hadi_handoff_selected_task) == str(live_task)
     )
+    local_complete_lane_failure_repair = (
+        all(artifacts.values())
+        and isinstance(local_feedback, dict)
+        and local_feedback.get('mode') in {'complete_active_lane', 'stale_complete_lane_record_reward_repair'}
+        and local_feedback.get('selection_source') == 'feedback_complete_active_lane_to_failure_learning'
+        and local_feedback.get('selected_task_id') == 'analyze-last-failed-candidate'
+        and str(local_task) == 'analyze-last-failed-candidate'
+    )
+    live_stale_complete_lane_reward = (
+        isinstance(live_feedback, dict)
+        and live_feedback.get('mode') == 'complete_active_lane'
+        and live_feedback.get('current_task_id') == 'materialize-pass-streak-improvement'
+        and live_feedback.get('selected_task_id') == 'record-reward'
+        and live_feedback.get('selection_source') == 'feedback_complete_active_lane'
+        and 'record-reward' in str(live_task or '')
+    )
     authority_resolution = None
     canonical_task = local_task or live_task
     if local_task and live_task and str(local_task) not in str(live_task):
@@ -902,6 +918,9 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         elif live_pass_streak_switch:
             authority_resolution = 'fresh_live_pass_streak_switch'
             canonical_task = live_task
+        elif local_complete_lane_failure_repair and live_stale_complete_lane_reward:
+            authority_resolution = 'local_failure_learning_repair_over_stale_live_complete_lane'
+            canonical_task = local_task
         else:
             reasons.append('current_task_drift')
     missing = [key for key, present in artifacts.items() if not present]
@@ -922,16 +941,38 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
 
 
 def _strong_reflection_freshness(cfg: DashboardConfig, now: datetime) -> dict:
-    path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'strong_reflection' / 'latest.json'
-    payload = _json_file(path)
+    local_path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'strong_reflection' / 'latest.json'
+    payload = _json_file(local_path)
+    source = 'local'
+    path = str(local_path)
+    errors: dict[str, str] = {}
+    if not payload and cfg.eeepc_ssh_key.exists():
+        remote_path = f"{cfg.eeepc_state_root}/strong_reflection/latest.json"
+        remote = _remote_file_preview(cfg, remote_path, max_chars=20000)
+        if remote.get('exists') and remote.get('preview'):
+            try:
+                parsed = json.loads(str(remote.get('preview')))
+                if isinstance(parsed, dict):
+                    payload = parsed
+                    source = 'eeepc'
+                    path = remote_path
+            except Exception as exc:
+                errors['eeepc_parse_error'] = str(exc)
+        elif remote.get('preview'):
+            errors['eeepc_preview_error'] = str(remote.get('preview'))[:500]
     if not payload:
-        return {
+        result = {
             'schema_version': 'strong-reflection-freshness-v1',
             'state': 'missing',
             'available': False,
-            'path': str(path),
+            'source': source,
+            'path': path,
+            'local_path': str(local_path),
             'reason': 'strong_reflection_latest_missing',
         }
+        if errors:
+            result['errors'] = errors
+        return result
     recorded_at = payload.get('recorded_at_utc')
     ts = _parse_timestamp(recorded_at) if recorded_at else None
     age = max(0, int((now.astimezone(timezone.utc) - ts).total_seconds())) if ts is not None else None
@@ -940,7 +981,9 @@ def _strong_reflection_freshness(cfg: DashboardConfig, now: datetime) -> dict:
         'schema_version': 'strong-reflection-freshness-v1',
         'state': state,
         'available': True,
-        'path': str(path),
+        'source': source,
+        'path': path,
+        'local_path': str(local_path),
         'recorded_at_utc': recorded_at,
         'age_seconds': age,
         'summary': payload.get('summary'),
@@ -2790,6 +2833,8 @@ def create_app(cfg: DashboardConfig):
                 'material_progress': _material_progress_summary(control_plane.get('material_progress') if isinstance(control_plane, dict) else None),
                 'autonomy_verdict': autonomy_verdict,
                 'runtime_parity': runtime_parity,
+                'ambition_utilization': ambition_utilization,
+                'strong_reflection_freshness': strong_reflection_freshness,
                 'eeepc_privileged_rollout_readiness': eeepc_privileged_rollout_readiness,
                 'host_resources': dict(repo_latest).get('host_resources') if repo_latest else None,
                 'host_resources': (control_plane.get('host_resources') if isinstance(control_plane, dict) else None),
