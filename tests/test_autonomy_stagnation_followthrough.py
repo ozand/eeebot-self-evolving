@@ -327,13 +327,79 @@ def test_stale_complete_lane_record_reward_revives_failure_learning(tmp_path: Pa
         improvement_score=1.2,
         feedback_decision=None,
         goals_dir=goals,
-        materialized_improvement_artifact_path=None,
     )
 
     assert plan['current_task_id'] == 'analyze-last-failed-candidate'
     assert plan['feedback_decision']['mode'] == 'stale_complete_lane_record_reward_repair'
     assert plan['feedback_decision']['selection_source'] == 'feedback_complete_active_lane_to_failure_learning'
     assert plan['feedback_decision']['selected_task_id'] == 'analyze-last-failed-candidate'
+
+
+def test_terminal_selfevo_issue_outranks_stale_complete_lane_repair_when_current_task_is_record_reward(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / 'workspace'
+    state_root = workspace / 'state'
+    goals = state_root / 'goals'
+    goals.mkdir(parents=True)
+    failure_dir = state_root / 'self_evolution' / 'failure_learning'
+    failure_dir.mkdir(parents=True)
+    failure_path = failure_dir / 'latest.json'
+    failure_path.write_text(json.dumps({
+        'schema_version': 'autoevolve-failure-learning-v1',
+        'candidate_id': 'candidate-stale-live',
+        'failed_commit': 'badc0ffee',
+        'health_reasons': ['stale_report'],
+    }), encoding='utf-8')
+    old_time = time.time() - 7200
+    os.utime(failure_path, (old_time, old_time))
+    artifact = state_root / 'materialized_improvements' / 'artifact.json'
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{}', encoding='utf-8')
+    (goals / 'current.json').write_text(json.dumps({
+        'schema_version': 'task-plan-v1',
+        'current_task_id': 'materialize-pass-streak-improvement',
+        'tasks': [
+            {'task_id': 'inspect-pass-streak', 'title': 'Inspect repeated PASS streak', 'status': 'done'},
+            {'task_id': 'materialize-pass-streak-improvement', 'title': 'Materialize improvement', 'status': 'active'},
+            {'task_id': 'record-reward', 'title': 'Record cycle reward', 'status': 'pending'},
+        ],
+    }), encoding='utf-8')
+    runtime_state = tmp_path / 'host-state'
+    runtime_dir = runtime_state / 'self_evolution' / 'runtime'
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / 'latest_issue_lifecycle.json').write_text(json.dumps({
+        'schema_version': 'autoevolve-issue-lifecycle-v1',
+        'status': 'terminal_merged',
+        'github_issue_state': 'CLOSED',
+        'issue_number': 61,
+        'selfevo_branch': 'fix/issue-61-analyze-last-failed-candidate',
+        'selfevo_issue': {'number': 61, 'title': 'Analyze the last failed self-evolution candidate before retrying mutation'},
+        'retry_allowed': False,
+        'source_task_id': 'analyze-last-failed-candidate',
+    }), encoding='utf-8')
+    monkeypatch.setenv('NANOBOT_RUNTIME_STATE_ROOT', str(runtime_state))
+
+    plan = _build_task_plan_snapshot(
+        workspace=workspace,
+        cycle_id='cycle-terminal-outranks-stale-repair',
+        goal_id='goal-bootstrap',
+        result_status='PASS',
+        approval_gate_state='fresh',
+        next_hint='continue',
+        experiment={'reward_signal': {'value': 1.2}, 'budget': {}, 'budget_used': {}, 'outcome': 'discard'},
+        report_path=tmp_path / 'report.json',
+        history_path=tmp_path / 'history.json',
+        improvement_score=1.2,
+        feedback_decision=None,
+        goals_dir=goals,
+        materialized_improvement_artifact_path=str(artifact),
+    )
+
+    assert plan['current_task_id'] == 'record-reward'
+    assert plan['feedback_decision']['mode'] == 'retire_terminal_selfevo_lane'
+    assert plan['feedback_decision']['selection_source'] == 'feedback_terminal_selfevo_retire'
+    assert plan['feedback_decision']['selected_task_id'] == 'record-reward'
+    assert plan['feedback_decision']['terminal_selfevo_issue']['selfevo_issue']['number'] == 61
+    assert all(task.get('task_id') != 'analyze-last-failed-candidate' or task.get('status') == 'done' for task in plan['tasks'])
 
 
 def test_failure_learning_uses_resolved_runtime_state_root(tmp_path: Path, monkeypatch) -> None:
@@ -356,3 +422,79 @@ def test_failure_learning_uses_resolved_runtime_state_root(tmp_path: Path, monke
     assert result is not None
     assert result['candidate_id'] == 'host-control-plane-candidate'
     assert result['_source_path'] == str(failure_dir / 'latest.json')
+
+
+def test_terminal_selfevo_issue_uses_resolved_runtime_state_root(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    runtime_state = tmp_path / 'host-state'
+    runtime_dir = runtime_state / 'self_evolution' / 'runtime'
+    runtime_dir.mkdir(parents=True)
+    lifecycle_path = runtime_dir / 'latest_issue_lifecycle.json'
+    lifecycle_path.write_text(json.dumps({
+        'schema_version': 'autoevolve-issue-lifecycle-v1',
+        'status': 'terminal_merged',
+        'github_issue_state': 'CLOSED',
+        'selfevo_branch': 'fix/issue-261-analyze-last-failed-candidate',
+        'selfevo_issue': {'number': 261, 'title': 'Analyze the last failed self-evolution candidate before retrying mutation'},
+        'retry_allowed': False,
+    }), encoding='utf-8')
+    monkeypatch.setenv('NANOBOT_RUNTIME_STATE_ROOT', str(runtime_state))
+
+    result = autoevolve.resolve_terminal_selfevo_issue(workspace=workspace, source_task_id='analyze-last-failed-candidate')
+
+    assert result is not None
+    assert result['number'] == 261
+    assert result['created'] is False
+    assert result['reused_terminal_lane'] is True
+    assert result['terminal_status'] == 'terminal_merged'
+
+
+def test_coordinator_retires_analyze_last_failed_candidate_when_terminal_issue_exists_only_in_runtime_state_root(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / 'workspace'
+    state_root = workspace / 'state'
+    goals = state_root / 'goals'
+    goals.mkdir(parents=True)
+    (goals / 'current.json').write_text(json.dumps({
+        'current_task_id': 'analyze-last-failed-candidate',
+        'tasks': [
+            {'task_id': 'analyze-last-failed-candidate', 'title': 'Analyze the last failed self-evolution candidate before retrying mutation', 'status': 'active'},
+            {'task_id': 'record-reward', 'title': 'Record cycle reward', 'status': 'pending'},
+        ],
+    }), encoding='utf-8')
+    runtime_state = tmp_path / 'host-state'
+    runtime_dir = runtime_state / 'self_evolution' / 'runtime'
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / 'latest_issue_lifecycle.json').write_text(json.dumps({
+        'schema_version': 'autoevolve-issue-lifecycle-v1',
+        'status': 'terminal_merged',
+        'github_issue_state': 'CLOSED',
+        'issue_number': 261,
+        'selfevo_branch': 'fix/issue-261-analyze-last-failed-candidate',
+        'selfevo_issue': {'number': 261, 'title': 'Analyze the last failed self-evolution candidate before retrying mutation'},
+        'retry_allowed': False,
+        'source_task_id': 'analyze-last-failed-candidate',
+    }), encoding='utf-8')
+    monkeypatch.setenv('NANOBOT_RUNTIME_STATE_ROOT', str(runtime_state))
+
+    plan = _build_task_plan_snapshot(
+        workspace=workspace,
+        cycle_id='cycle-retire-terminal-selfevo-runtime-root',
+        goal_id='goal-bootstrap',
+        result_status='PASS',
+        approval_gate_state='fresh',
+        next_hint='continue',
+        experiment={'reward_signal': {'value': 1.0}, 'budget': {}, 'budget_used': {}, 'outcome': 'discard', 'revert_status': 'skipped_no_material_change'},
+        report_path=tmp_path / 'report.json',
+        history_path=tmp_path / 'history.json',
+        improvement_score=1.0,
+        feedback_decision=None,
+        goals_dir=goals,
+    )
+
+    assert plan['current_task_id'] == 'record-reward'
+    assert plan['feedback_decision']['mode'] == 'retire_terminal_selfevo_lane'
+    assert plan['feedback_decision']['selection_source'] == 'feedback_terminal_selfevo_retire'
+    assert plan['feedback_decision']['selected_task_id'] == 'record-reward'
+    assert plan['feedback_decision']['terminal_selfevo_issue']['selfevo_issue']['number'] == 261
+    assert all(task.get('task_id') != 'analyze-last-failed-candidate' or task.get('status') == 'done' for task in plan['tasks'])

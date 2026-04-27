@@ -1997,17 +1997,22 @@ def _selected_hypothesis_diagnostics(*, cycles: list[dict], hypotheses_visibilit
                 continue
 
     latest_cycle = window_cycles[0] if window_cycles else (matched_cycles[0] if matched_cycles else None)
-    latest_cycle_detail = _cycle_detail(latest_cycle) if latest_cycle else {}
     reward_gate = credits_visibility.get('current', {}).get('reward_gate') if isinstance(credits_visibility.get('current'), dict) else {}
     if not isinstance(reward_gate, dict):
         reward_gate = {}
     terminal_issue, terminal_pr = _selected_hypothesis_terminal_evidence(cfg)
+    run_count = len(window_cycles)
+    selected_hypothesis_repetition = run_count >= 5
     state = 'stagnant' if (
-        run_count := len(window_cycles)
-    ) and run_streak >= 5 and outcome_counts['discard'] == run_count and reward_gate.get('status') == 'suppressed' and (terminal_issue or terminal_pr) else 'healthy'
+        run_count
+        and selected_hypothesis_repetition
+        and outcome_counts['discard'] == run_count
+        and reward_gate.get('status') == 'suppressed'
+        and (terminal_issue or terminal_pr)
+    ) else 'healthy'
     reasons: list[str] = []
     if run_count:
-        if run_streak >= 5:
+        if selected_hypothesis_repetition:
             reasons.append('selected_hypothesis_repetition')
         if outcome_counts['discard'] == run_count:
             reasons.append('discard_only_selected_hypothesis')
