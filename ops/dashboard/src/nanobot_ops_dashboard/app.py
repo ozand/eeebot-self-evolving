@@ -1067,7 +1067,7 @@ def _ambition_utilization_verdict(*, analytics: dict, experiment_visibility: dic
     }
 
 
-def _autonomy_verdict(*, analytics: dict, plan_latest: dict | None, experiment_visibility: dict, credits_visibility: dict, cfg: DashboardConfig, material_progress: dict | None = None, runtime_parity: dict | None = None, ambition_utilization: dict | None = None) -> dict:
+def _autonomy_verdict(*, analytics: dict, plan_latest: dict | None, experiment_visibility: dict, credits_visibility: dict, cfg: DashboardConfig, material_progress: dict | None = None, runtime_parity: dict | None = None, ambition_utilization: dict | None = None, hypothesis_dynamics: dict | None = None) -> dict:
     reasons: list[str] = []
     state_root = cfg.nanobot_repo_root / 'workspace' / 'state'
     recent = analytics.get('recent_status_sequence') or []
@@ -1113,6 +1113,9 @@ def _autonomy_verdict(*, analytics: dict, plan_latest: dict | None, experiment_v
     if runtime_parity_is_blocking and not runtime_can_be_historical:
         reasons.append('runtime_parity_blocked')
     ambition_utilization = ambition_utilization if isinstance(ambition_utilization, dict) else {}
+    hypothesis_dynamics = hypothesis_dynamics if isinstance(hypothesis_dynamics, dict) else {}
+    if hypothesis_dynamics.get('state') == 'stagnant':
+        reasons.append('hypothesis_dynamics_stagnant')
     historical_reasons: list[str] = []
     if material_allows_healthy:
         stale_after_material_progress = {'same_task_streak', 'discarded_experiment', 'suppressed_reward', 'terminal_noop'}
@@ -1125,7 +1128,7 @@ def _autonomy_verdict(*, analytics: dict, plan_latest: dict | None, experiment_v
         if runtime_parity_is_blocking and runtime_can_be_historical:
             historical_reasons.append('runtime_parity_blocked')
         reasons = blocking_reasons
-    status = 'healthy_progress' if material_allows_healthy and not reasons else ('stagnant' if any(reason in reasons for reason in {'same_task_streak', 'discarded_experiment', 'terminal_noop', 'material_progress_missing', 'runtime_parity_blocked', 'ambition_underutilized'}) else 'healthy')
+    status = 'healthy_progress' if material_allows_healthy and not reasons else ('stagnant' if any(reason in reasons for reason in {'same_task_streak', 'discarded_experiment', 'terminal_noop', 'material_progress_missing', 'runtime_parity_blocked', 'ambition_underutilized', 'hypothesis_dynamics_stagnant'}) else 'healthy')
     return {
         'schema_version': 'autonomy-verdict-v1',
         'state': status,
@@ -1828,6 +1831,234 @@ def _discover_hypotheses_visibility(cfg: DashboardConfig) -> dict:
     }
 
 
+def _selected_hypothesis_terminal_evidence(cfg: DashboardConfig) -> tuple[dict | None, dict | None]:
+    state_root = cfg.nanobot_repo_root / 'workspace' / 'state' / 'self_evolution'
+    current_state = _json_file(state_root / 'current_state.json')
+    latest_noop = _json_file(state_root / 'runtime' / 'latest_noop.json')
+    issue = current_state.get('selfevo_issue') if isinstance(current_state.get('selfevo_issue'), dict) else latest_noop.get('selfevo_issue') if isinstance(latest_noop.get('selfevo_issue'), dict) else None
+    pr = current_state.get('last_pr') if isinstance(current_state.get('last_pr'), dict) else latest_noop.get('pr') if isinstance(latest_noop.get('pr'), dict) else None
+    return issue, pr
+
+
+def _selected_hypothesis_diagnostics(*, cycles: list[dict], hypotheses_visibility: dict, credits_visibility: dict, cfg: DashboardConfig) -> dict:
+    visibility = hypotheses_visibility if isinstance(hypotheses_visibility, dict) else {}
+    selected_id = visibility.get('selected_hypothesis_id')
+    selected_title = visibility.get('selected_hypothesis_title')
+    selected_score = visibility.get('selected_hypothesis_score')
+    selected_wsjf = visibility.get('selected_hypothesis_wsjf')
+
+    def _report_source_candidates(detail: dict) -> list[str]:
+        candidates: list[str] = []
+        for key in ('report_source', 'reportSource', 'report_path', 'reportPath'):
+            value = detail.get(key)
+            if _has_value(value):
+                candidates.append(str(value))
+        artifact_paths = detail.get('artifact_paths')
+        if isinstance(artifact_paths, str):
+            parsed = _json_loads_any(artifact_paths)
+            if isinstance(parsed, list):
+                artifact_paths = parsed
+        if isinstance(artifact_paths, list):
+            for artifact_path in artifact_paths:
+                if _has_value(artifact_path):
+                    candidates.append(str(artifact_path))
+        artifact_paths_json = detail.get('artifact_paths_json')
+        if isinstance(artifact_paths_json, str):
+            for artifact_path in _json_loads_list(artifact_paths_json):
+                if _has_value(artifact_path):
+                    candidates.append(str(artifact_path))
+        seen: set[str] = set()
+        ordered_candidates: list[str] = []
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                ordered_candidates.append(normalized)
+        return ordered_candidates
+
+    def _resolve_report_source_path(report_source: str) -> Path | None:
+        if not _has_value(report_source):
+            return None
+        text = str(report_source).strip()
+        stripped = text.lstrip('/\\')
+        candidates = [Path(text)]
+        if stripped:
+            candidates.extend([
+                cfg.nanobot_repo_root / stripped,
+                cfg.project_root / stripped,
+            ])
+        for path in candidates:
+            try:
+                if path.exists():
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _hydrate_cycle_detail(row: dict) -> dict:
+        detail = dict(row.get('detail')) if isinstance(row.get('detail'), dict) else {}
+        hydrated = dict(detail)
+        for report_source in _report_source_candidates(detail):
+            path = _resolve_report_source_path(report_source)
+            if path is None:
+                continue
+            payload = _json_file(path)
+            if not isinstance(payload, dict):
+                continue
+            hydrated.setdefault('report_source', report_source)
+            hydrated.setdefault('report_source_path', str(path))
+            hydrated.update(payload)
+            for key in ('current_plan', 'currentPlan', 'task_plan', 'taskPlan', 'plan'):
+                nested = payload.get(key)
+                if isinstance(nested, dict):
+                    hydrated.update(nested)
+            break
+        return hydrated
+
+    def _matches_selected(row: dict) -> bool:
+        detail = _hydrate_cycle_detail(row)
+        task_id = _first_present(detail, ('current_task_id', 'currentTaskId', 'task_id', 'taskId')) or row.get('title')
+        hypothesis_id = _first_present(detail, ('selected_hypothesis_id', 'selectedHypothesisId', 'hypothesis_id', 'hypothesisId')) or task_id
+        title_candidates = [
+            row.get('title'),
+            detail.get('selected_hypothesis_title'),
+            detail.get('hypothesis_title'),
+            detail.get('current_task'),
+            detail.get('current_task_title'),
+            detail.get('title'),
+        ]
+        if _has_value(selected_id):
+            return str(task_id) == str(selected_id) or str(hypothesis_id) == str(selected_id)
+        if _has_value(selected_title):
+            return any(_has_value(candidate) and str(candidate) == str(selected_title) for candidate in title_candidates)
+        return False
+
+    ordered_cycles = sorted(cycles or [], key=lambda row: _coerce_timestamp(row.get('collected_at')) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    matched_cycles = [row for row in ordered_cycles if _matches_selected(row)]
+    if matched_cycles:
+        reference_dt = _coerce_timestamp(matched_cycles[0].get('collected_at')) or datetime.now(timezone.utc)
+    elif ordered_cycles:
+        reference_dt = _coerce_timestamp(ordered_cycles[0].get('collected_at')) or datetime.now(timezone.utc)
+    else:
+        reference_dt = datetime.now(timezone.utc)
+    window_start = reference_dt - timedelta(hours=24)
+
+    window_cycles = []
+    for row in matched_cycles:
+        ts = _coerce_timestamp(row.get('collected_at'))
+        if ts is not None and ts >= window_start:
+            window_cycles.append(row)
+
+    run_streak = 0
+    for row in ordered_cycles:
+        ts = _coerce_timestamp(row.get('collected_at'))
+        if ts is None or ts < window_start:
+            break
+        if _matches_selected(row):
+            run_streak += 1
+        else:
+            break
+
+    def _cycle_detail(row: dict) -> dict:
+        return _hydrate_cycle_detail(row)
+
+    def _cycle_outcome(row: dict) -> str | None:
+        detail = _cycle_detail(row)
+        experiment = detail.get('experiment') if isinstance(detail.get('experiment'), dict) else {}
+        return experiment.get('outcome') or detail.get('outcome') or row.get('status')
+
+    def _cycle_budget_used(row: dict) -> dict:
+        detail = _cycle_detail(row)
+        budget_used = detail.get('budget_used') if isinstance(detail.get('budget_used'), dict) else {}
+        if not budget_used:
+            experiment = detail.get('experiment') if isinstance(detail.get('experiment'), dict) else {}
+            budget_used = experiment.get('budget_used') if isinstance(experiment.get('budget_used'), dict) else {}
+        if not budget_used and isinstance(detail.get('current_plan'), dict):
+            budget_used = detail['current_plan'].get('budget_used') if isinstance(detail['current_plan'].get('budget_used'), dict) else {}
+        return budget_used if isinstance(budget_used, dict) else {}
+
+    def _cycle_feedback_decision(row: dict):
+        detail = _cycle_detail(row)
+        feedback_decision = detail.get('feedback_decision')
+        return feedback_decision if isinstance(feedback_decision, dict) else feedback_decision
+
+    outcome_counts = {'discard': 0, 'pass': 0, 'block': 0, 'other': 0}
+    budget_sum = {'requests': 0, 'tool_calls': 0, 'subagents': 0, 'elapsed_seconds': 0}
+    for row in window_cycles:
+        outcome = str(_cycle_outcome(row) or 'other').lower()
+        if outcome not in outcome_counts:
+            outcome = 'other'
+        outcome_counts[outcome] += 1
+        budget_used = _cycle_budget_used(row)
+        for key in budget_sum:
+            try:
+                budget_sum[key] += int(budget_used.get(key) or 0)
+            except Exception:
+                continue
+
+    latest_cycle = window_cycles[0] if window_cycles else (matched_cycles[0] if matched_cycles else None)
+    latest_cycle_detail = _cycle_detail(latest_cycle) if latest_cycle else {}
+    reward_gate = credits_visibility.get('current', {}).get('reward_gate') if isinstance(credits_visibility.get('current'), dict) else {}
+    if not isinstance(reward_gate, dict):
+        reward_gate = {}
+    terminal_issue, terminal_pr = _selected_hypothesis_terminal_evidence(cfg)
+    state = 'stagnant' if (
+        run_count := len(window_cycles)
+    ) and run_streak >= 5 and outcome_counts['discard'] == run_count and reward_gate.get('status') == 'suppressed' and (terminal_issue or terminal_pr) else 'healthy'
+    reasons: list[str] = []
+    if run_count:
+        if run_streak >= 5:
+            reasons.append('selected_hypothesis_repetition')
+        if outcome_counts['discard'] == run_count:
+            reasons.append('discard_only_selected_hypothesis')
+        if reward_gate.get('status') == 'suppressed':
+            reasons.append('suppressed_reward_gate')
+        if terminal_issue or terminal_pr:
+            reasons.append('terminal_selfevo_issue_present')
+    if state == 'stagnant':
+        reasons.insert(0, 'selected_hypothesis_stagnant')
+
+    return {
+        'schema_version': 'hypothesis-dynamics-v1',
+        'state': state,
+        'reasons': reasons,
+        'selected_hypothesis_id': str(selected_id) if _has_value(selected_id) else None,
+        'selected_hypothesis_title': str(selected_title) if _has_value(selected_title) else None,
+        'selected_hypothesis_score': selected_score,
+        'selected_hypothesis_score_text': _hypothesis_score_text(selected_score),
+        'selected_hypothesis_wsjf': selected_wsjf,
+        'selected_hypothesis_wsjf_text': _wsjf_text(selected_wsjf),
+        'selected_hypothesis_feedback_decision': _cycle_feedback_decision(latest_cycle) if latest_cycle else None,
+        'selected_hypothesis_experiment_outcome': _cycle_outcome(latest_cycle) if latest_cycle else None,
+        'run_count': run_count,
+        'run_streak': run_streak,
+        'window_hours': 24,
+        'last_24h': {
+            'window_hours': 24,
+            'total_runs': run_count,
+            'discard_count': outcome_counts['discard'],
+            'pass_count': outcome_counts['pass'],
+            'block_count': outcome_counts['block'],
+            'other_count': outcome_counts['other'],
+            'budget_used_sum': budget_sum,
+            'reward_gate': {
+                'status': reward_gate.get('status'),
+                'reason': reward_gate.get('reason'),
+            },
+            'terminal_selfevo_issue': terminal_issue,
+            'terminal_selfevo_pr': terminal_pr,
+            'latest_outcome': _cycle_outcome(latest_cycle) if latest_cycle else None,
+            'latest_feedback_decision': _cycle_feedback_decision(latest_cycle) if latest_cycle else None,
+        },
+        'reward_gate': {
+            'status': reward_gate.get('status'),
+            'reason': reward_gate.get('reason'),
+        },
+        'terminal_selfevo_issue': terminal_issue,
+        'terminal_selfevo_pr': terminal_pr,
+    }
+
+
 def _plan_snapshot_from_row(row) -> dict:
     item = dict(row)
     raw = _json_loads_dict(item.get('raw_json'))
@@ -2485,6 +2716,13 @@ def create_app(cfg: DashboardConfig):
         strong_reflection_freshness = _strong_reflection_freshness(cfg, now)
         analytics['ambition_utilization'] = ambition_utilization
         analytics['strong_reflection_freshness'] = strong_reflection_freshness
+        hypothesis_dynamics = _selected_hypothesis_diagnostics(
+            cycles=cycles,
+            hypotheses_visibility=hypotheses_visibility,
+            credits_visibility=credits_visibility,
+            cfg=cfg,
+        )
+        hypotheses_visibility = {**hypotheses_visibility, 'selected_hypothesis_diagnostics': hypothesis_dynamics}
         autonomy_verdict = _autonomy_verdict(
             analytics=analytics,
             plan_latest=plan_latest,
@@ -2494,8 +2732,10 @@ def create_app(cfg: DashboardConfig):
             material_progress=control_plane.get('material_progress') if isinstance(control_plane, dict) else None,
             runtime_parity=runtime_parity,
             ambition_utilization=ambition_utilization,
+            hypothesis_dynamics=hypothesis_dynamics,
         )
         analytics['runtime_parity'] = runtime_parity
+        analytics['hypothesis_dynamics'] = hypothesis_dynamics
         analytics['autonomy_verdict'] = autonomy_verdict
         if isinstance(control_plane, dict):
             control_plane = dict(control_plane)
@@ -2503,6 +2743,7 @@ def create_app(cfg: DashboardConfig):
             control_plane['runtime_parity'] = runtime_parity
             control_plane['ambition_utilization'] = ambition_utilization
             control_plane['strong_reflection_freshness'] = strong_reflection_freshness
+            control_plane['hypothesis_dynamics'] = hypothesis_dynamics
             control_plane['autonomy_verdict'] = autonomy_verdict
 
         request_source = query.get('source', [''])[0]
@@ -2890,6 +3131,7 @@ def create_app(cfg: DashboardConfig):
                 'material_progress': _material_progress_summary(control_plane.get('material_progress') if isinstance(control_plane, dict) else None),
                 'autonomy_verdict': autonomy_verdict,
                 'runtime_parity': runtime_parity,
+                'hypothesis_dynamics': hypothesis_dynamics,
                 'ambition_utilization': ambition_utilization,
                 'strong_reflection_freshness': strong_reflection_freshness,
                 'eeepc_privileged_rollout_readiness': eeepc_privileged_rollout_readiness,
