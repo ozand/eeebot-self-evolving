@@ -962,3 +962,119 @@ def test_strong_reflection_freshness_exposes_latest_artifact(tmp_path: Path) -> 
     assert result['state'] == 'fresh'
     assert result['available'] is True
     assert result['summary'].startswith('Self-evolving cycle PASS')
+
+
+def test_runtime_parity_accepts_local_failure_learning_repair_over_stale_live_complete_lane(tmp_path: Path) -> None:
+    from nanobot_ops_dashboard.app import _dashboard_runtime_parity
+
+    state = tmp_path / 'repo' / 'workspace' / 'state'
+    for rel in [
+        'hypotheses/backlog.json',
+        'credits/latest.json',
+        'control_plane/current_summary.json',
+        'self_evolution/current_state.json',
+    ]:
+        path = state / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}', encoding='utf-8')
+    cfg = DashboardConfig(project_root=tmp_path / 'dashboard', nanobot_repo_root=tmp_path / 'repo', db_path=tmp_path / 'dashboard.sqlite3', eeepc_ssh_host='eeepc', eeepc_ssh_key=tmp_path / 'missing', eeepc_state_root='/state')
+    repo_plan = {
+        'current_task_id': 'analyze-last-failed-candidate',
+        'feedback_decision': {
+            'mode': 'complete_active_lane',
+            'selection_source': 'feedback_complete_active_lane_to_failure_learning',
+            'selected_task_id': 'analyze-last-failed-candidate',
+        },
+    }
+    live_plan = {
+        'current_task_id': 'record-reward',
+        'task_selection_source': 'feedback_complete_active_lane',
+        'feedback_decision': {
+            'mode': 'complete_active_lane',
+            'current_task_id': 'materialize-pass-streak-improvement',
+            'selected_task_id': 'record-reward',
+            'selection_source': 'feedback_complete_active_lane',
+        },
+    }
+
+    result = _dashboard_runtime_parity(repo_plan, live_plan, cfg)
+
+    assert result['state'] == 'healthy'
+    assert result['reasons'] == []
+    assert result['canonical_current_task_id'] == 'analyze-last-failed-candidate'
+    assert result['authority_resolution'] == 'local_failure_learning_repair_over_stale_live_complete_lane'
+
+
+def test_api_system_exposes_ambition_and_strong_reflection_top_level(tmp_path: Path) -> None:
+    project_root = tmp_path / 'dashboard'
+    repo_root = tmp_path / 'nanobot'
+    db = tmp_path / 'dashboard.sqlite3'
+    init_db(db)
+    state_root = repo_root / 'workspace' / 'state'
+    latest = state_root / 'strong_reflection' / 'latest.json'
+    latest.parent.mkdir(parents=True)
+    latest.write_text(json.dumps({
+        'schema_version': 'strong-reflection-run-v1',
+        'recorded_at_utc': '2026-04-27T20:00:00+00:00',
+        'summary': 'Self-evolving cycle PASS — evidence=e-system',
+        'mode': 'strong-reflection',
+    }), encoding='utf-8')
+    (state_root / 'goals').mkdir(parents=True, exist_ok=True)
+    (state_root / 'goals' / 'current.json').write_text(json.dumps({
+        'schema_version': 'task-plan-v1',
+        'current_task_id': 'inspect-pass-streak',
+        'current_task': 'Inspect repeated PASS streak for a new bounded improvement',
+        'tasks': [],
+    }), encoding='utf-8')
+    cfg = DashboardConfig(
+        project_root=project_root,
+        nanobot_repo_root=repo_root,
+        db_path=db,
+        eeepc_ssh_host='eeepc',
+        eeepc_ssh_key=tmp_path / 'missing-key',
+        eeepc_state_root='/state',
+    )
+
+    system = _call_json(create_app(cfg), '/api/system')
+
+    assert system['ambition_utilization']['schema_version'] == 'ambition-utilization-v1'
+    assert system['strong_reflection_freshness']['schema_version'] == 'strong-reflection-freshness-v1'
+    assert system['strong_reflection_freshness']['available'] is True
+
+
+def test_strong_reflection_freshness_falls_back_to_live_eeepc_artifact(tmp_path: Path, monkeypatch) -> None:
+    from datetime import datetime, timezone
+    import nanobot_ops_dashboard.app as dashboard_app
+    from nanobot_ops_dashboard.app import _strong_reflection_freshness
+
+    def fake_remote_file_preview(cfg, remote_path: str, max_chars: int = 800) -> dict:
+        return {
+            'path': remote_path,
+            'exists': True,
+            'preview': json.dumps({
+                'schema_version': 'strong-reflection-run-v1',
+                'recorded_at_utc': '2026-04-27T20:00:00+00:00',
+                'summary': 'Self-evolving cycle PASS — evidence=live',
+                'mode': 'strong-reflection',
+            }),
+        }
+
+    monkeypatch.setattr(dashboard_app, '_remote_file_preview', fake_remote_file_preview)
+    key_path = tmp_path / 'missing-key'
+    key_path.write_text('test-key', encoding='utf-8')
+    cfg = DashboardConfig(
+        project_root=tmp_path / 'dashboard',
+        nanobot_repo_root=tmp_path / 'repo',
+        db_path=tmp_path / 'dashboard.sqlite3',
+        eeepc_ssh_host='eeepc',
+        eeepc_ssh_key=key_path,
+        eeepc_state_root='/var/lib/eeepc-agent/self-evolving-agent/state',
+    )
+
+    result = _strong_reflection_freshness(cfg, datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc))
+
+    assert result['available'] is True
+    assert result['state'] == 'fresh'
+    assert result['source'] == 'eeepc'
+    assert result['path'] == '/var/lib/eeepc-agent/self-evolving-agent/state/strong_reflection/latest.json'
+    assert result['summary'].endswith('live')
