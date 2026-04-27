@@ -1,10 +1,12 @@
 import asyncio
 import json
+import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from nanobot.runtime.coordinator import run_self_evolving_cycle
+from nanobot.runtime.coordinator import _build_task_plan_snapshot, run_self_evolving_cycle
 
 
 def _read_json(path: Path):
@@ -64,6 +66,84 @@ def test_retired_record_reward_does_not_mask_fresh_failure_learning_even_with_te
     report = _read_json(sorted((tmp_path / 'state' / 'reports').glob('evolution-*.json'))[-1])
     assert report['current_task_id'] == 'analyze-last-failed-candidate'
     assert report['feedback_decision']['selection_source'] == 'feedback_fresh_failure_learning_after_reward_retirement'
+
+
+def test_terminal_selfevo_issue_outranks_stale_complete_lane_repair_when_current_task_is_record_reward(tmp_path: Path, monkeypatch):
+    approvals_dir = tmp_path / 'state' / 'approvals'
+    approvals_dir.mkdir(parents=True)
+    expires_at = datetime(2026, 4, 27, 2, 30, tzinfo=timezone.utc)
+    (approvals_dir / 'apply.ok').write_text(json.dumps({'expires_at_utc': expires_at.isoformat(), 'ttl_minutes': 120}), encoding='utf-8')
+
+    goals_dir = tmp_path / 'state' / 'goals'
+    goals_dir.mkdir(parents=True)
+    (goals_dir / 'current.json').write_text(json.dumps({
+        'schema_version': 'task-plan-v1',
+        'current_task_id': 'materialize-pass-streak-improvement',
+        'tasks': [
+            {'task_id': 'inspect-pass-streak', 'title': 'Inspect repeated PASS streak', 'status': 'done'},
+            {'task_id': 'materialize-pass-streak-improvement', 'title': 'Materialize improvement', 'status': 'active'},
+            {'task_id': 'record-reward', 'title': 'Record cycle reward', 'status': 'pending'},
+        ],
+        'feedback_decision': {
+            'mode': 'complete_active_lane',
+            'current_task_id': 'materialize-pass-streak-improvement',
+            'selected_task_id': 'record-reward',
+            'selection_source': 'feedback_complete_active_lane',
+        },
+    }), encoding='utf-8')
+
+    learning_dir = tmp_path / 'state' / 'self_evolution' / 'failure_learning'
+    learning_dir.mkdir(parents=True, exist_ok=True)
+    failure_path = learning_dir / 'latest.json'
+    failure_path.write_text(json.dumps({
+        'schema_version': 'autoevolve-failure-learning-v1',
+        'candidate_id': 'candidate-stale-live',
+        'failed_commit': 'deadbeef',
+        'health_reasons': ['stale_report'],
+    }), encoding='utf-8')
+    old_time = time.time() - 7200
+    os.utime(failure_path, (old_time, old_time))
+
+    runtime_state = tmp_path / 'host-state'
+    runtime_dir = runtime_state / 'self_evolution' / 'runtime'
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / 'latest_issue_lifecycle.json').write_text(json.dumps({
+        'schema_version': 'autoevolve-issue-lifecycle-v1',
+        'status': 'terminal_merged',
+        'github_issue_state': 'CLOSED',
+        'issue_number': 61,
+        'selfevo_branch': 'fix/issue-61-analyze-last-failed-candidate',
+        'selfevo_issue': {'number': 61, 'title': 'Analyze the last failed self-evolution candidate before retrying mutation'},
+        'retry_allowed': False,
+        'source_task_id': 'analyze-last-failed-candidate',
+    }), encoding='utf-8')
+    monkeypatch.setenv('NANOBOT_RUNTIME_STATE_ROOT', str(runtime_state))
+
+    artifact = goals_dir.parent / 'materialized_improvements' / 'artifact.json'
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text('{}', encoding='utf-8')
+
+    plan = _build_task_plan_snapshot(
+        workspace=tmp_path,
+        cycle_id='cycle-terminal-outranks-stale-repair',
+        goal_id='goal-bootstrap',
+        result_status='PASS',
+        approval_gate_state='fresh',
+        next_hint='continue',
+        experiment={'reward_signal': {'value': 1.2}, 'budget': {}, 'budget_used': {}, 'outcome': 'discard'},
+        report_path=tmp_path / 'state' / 'reports' / 'report.json',
+        history_path=tmp_path / 'state' / 'goals' / 'history.json',
+        improvement_score=1.2,
+        feedback_decision=None,
+        goals_dir=goals_dir,
+        materialized_improvement_artifact_path=str(artifact),
+    )
+
+    assert plan['current_task_id'] == 'record-reward'
+    assert plan['feedback_decision']['mode'] == 'retire_terminal_selfevo_lane'
+    assert plan['feedback_decision']['selection_source'] == 'feedback_terminal_selfevo_retire'
+    assert plan['feedback_decision']['selected_task_id'] == 'record-reward'
+    assert plan['feedback_decision']['terminal_selfevo_issue']['selfevo_issue']['number'] == 61
 
 
 def test_stale_subagent_lane_retirement_prefers_fresh_failure_learning_over_record_reward(tmp_path: Path):
