@@ -1499,7 +1499,7 @@ def _build_task_plan_snapshot(
                 task["status"] = "pending"
         combined_candidates = [candidate for candidate in combined_candidates if candidate.get("task_id") not in {"inspect-pass-streak", "materialize-pass-streak-improvement"}]
         next_candidate = next((candidate for candidate in combined_candidates if candidate.get("task_id") == "subagent-verify-materialized-improvement"), None)
-        if next_candidate is not None:
+        if next_candidate is not None and not isinstance(latest_failure_learning, dict):
             for task in tasks:
                 if task.get("task_id") == next_candidate.get("task_id"):
                     task["status"] = "active"
@@ -1524,7 +1524,7 @@ def _build_task_plan_snapshot(
             completion_target_title = "Record cycle reward"
             completion_selection_source = "feedback_complete_active_lane"
             completion_reason = "materialized improvement artifact written; richer execution lane completed"
-            if failure_learning_is_fresh and isinstance(latest_failure_learning, dict):
+            if isinstance(latest_failure_learning, dict):
                 completion_target_id = "analyze-last-failed-candidate"
                 completion_target_title = "Analyze the last failed self-evolution candidate before retrying mutation"
                 completion_selection_source = "feedback_complete_active_lane_to_failure_learning"
