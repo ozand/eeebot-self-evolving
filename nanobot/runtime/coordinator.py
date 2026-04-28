@@ -41,6 +41,21 @@ CORE_TASK_IDS = {
     "record-reward",
 }
 
+COMPLETED_TASK_STATUSES = {
+    "blocked",
+    "canceled",
+    "cancelled",
+    "closed",
+    "done",
+    "failed",
+    "terminal",
+    "terminal_blocked",
+    "terminal_closed",
+    "terminal_failed",
+    "terminal_merged",
+    "terminal_noop",
+}
+
 
 TASK_ACTION_CLASS_BY_ID = {
     "refresh-approval-gate": "remediation",
@@ -97,6 +112,17 @@ def _task_action_class(task_id: str | None) -> str:
     if not task_id:
         return "unknown"
     return TASK_ACTION_CLASS_BY_ID.get(str(task_id), "other")
+
+
+def _task_status(task: dict[str, Any] | None) -> str:
+    if not isinstance(task, dict):
+        return ""
+    return str(task.get("status") or "pending").strip().lower()
+
+
+def _task_is_selectable(task: dict[str, Any] | None) -> bool:
+    status = _task_status(task)
+    return status not in COMPLETED_TASK_STATUSES
 
 
 def _render_task_selection(task: dict[str, Any]) -> str:
@@ -324,7 +350,7 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
             selection_source = "feedback_discard_revert_generated"
     elif current_task_id == "inspect-pass-streak":
         followup_task = next((task for task in task_records if (task.get("task_id") or task.get("taskId")) == "materialize-pass-streak-improvement"), None)
-        if followup_task is not None:
+        if followup_task is not None and _task_is_selectable(followup_task):
             decision = {
                 "mode": "promote_review_followup",
                 "reason": "active inspect-pass-streak review produced a concrete bounded follow-up candidate",
@@ -344,7 +370,7 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
             }
             return decision
         active_task = next((task for task in task_records if (task.get("task_id") or task.get("taskId")) == current_task_id), None)
-        if active_task is not None and strong_pass_count >= GOAL_ROTATION_STREAK_LIMIT:
+        if active_task is not None and strong_pass_count >= GOAL_ROTATION_STREAK_LIMIT and followup_task is None:
             return {
                 "mode": "continue_active_lane",
                 "reason": "active inspect-pass-streak review lane remains bounded when the repeated PASS signature belongs to a prior lane",
@@ -415,9 +441,9 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
         mode = "retire_goal_artifact_pair"
         reason = "goal/artifact PASS streak reached retirement threshold; deprioritize the pair next cycle"
         if current_task_id and current_task_id not in CORE_TASK_IDS:
-            for task in task_records:
+            for task in tasks:
                 task_id = task.get("task_id") or task.get("taskId")
-                if task_id == "materialize-pass-streak-improvement":
+                if task_id == "materialize-pass-streak-improvement" and _task_is_selectable(task):
                     selected_task = task
                     selection_source = "feedback_review_to_execution"
                     mode = "promote_review_followup"
@@ -430,7 +456,7 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
                     task_id = task.get("task_id") or task.get("taskId")
                     if task_id == current_task_id:
                         continue
-                    if task_id == preferred_id:
+                    if task_id == preferred_id and _task_is_selectable(task):
                         selected_task = task
                         selection_source = "feedback_pass_streak_switch"
                         break
@@ -439,9 +465,9 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
         if selected_task is None:
             for task in task_records:
                 task_id = task.get("task_id") or task.get("taskId")
-                if task_id in {None, current_task_id, "record-reward"}:
+                if task_id in {None, current_task_id}:
                     continue
-                if (task.get("status") or "pending") in {"pending", "active"}:
+                if _task_is_selectable(task):
                     selected_task = task
                     selection_source = "feedback_pass_streak_switch"
                     break
@@ -1096,7 +1122,7 @@ def _inferred_generated_candidates_from_tasks(tasks: list[dict[str, Any]]) -> li
         if not isinstance(task, dict):
             continue
         task_id = task.get("task_id") or task.get("taskId")
-        if not task_id or task_id in CORE_TASK_IDS or task.get("status") == "done":
+        if not task_id or task_id in CORE_TASK_IDS or not _task_is_selectable(task):
             continue
         inferred.append({
             "task_id": task_id,
@@ -1379,7 +1405,19 @@ def _build_task_plan_snapshot(
     )
     if recorded_terminal_selfevo_retirement:
         terminal_selfevo_retired = True
-    if terminal_selfevo_issue is not None and current_task_id == "analyze-last-failed-candidate":
+        for task in tasks:
+            if task.get("task_id") == "analyze-last-failed-candidate":
+                task["status"] = "done"
+                task["terminal_reason"] = terminal_selfevo_issue.get("terminal_status") or "terminal_selfevo_issue"
+            elif task.get("task_id") == "record-reward":
+                task["status"] = "active"
+            elif task.get("status") == "active":
+                task["status"] = "pending"
+        if not any(task.get("task_id") == "record-reward" for task in tasks):
+            tasks.append({"task_id": "record-reward", "title": "Record cycle reward", "status": "active"})
+        current_task_id = "record-reward"
+        feedback_decision = None
+    if terminal_selfevo_issue is not None and not terminal_selfevo_retired and current_task_id == "analyze-last-failed-candidate":
         for task in tasks:
             if task.get("task_id") == "analyze-last-failed-candidate":
                 task["status"] = "done"
@@ -1554,7 +1592,7 @@ def _build_task_plan_snapshot(
         if not cid or cid in seen_candidate_ids:
             continue
         matching_task = next((task for task in tasks if task.get("task_id") == cid), None)
-        if isinstance(matching_task, dict) and matching_task.get("status") == "done":
+        if isinstance(matching_task, dict) and not _task_is_selectable(matching_task):
             continue
         combined_candidates.append(candidate)
         seen_candidate_ids.add(cid)
