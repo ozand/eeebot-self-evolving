@@ -1042,8 +1042,9 @@ def _strong_reflection_freshness(cfg: DashboardConfig, now: datetime, eeepc_late
     source = 'local'
     path = str(local_path)
     errors: dict[str, str] = {}
-    if not payload and isinstance(eeepc_latest, dict):
-        eeepc_raw = _json_loads_dict(eeepc_latest.get('raw_json'))
+    if not payload and eeepc_latest is not None:
+        eeepc_row = dict(eeepc_latest)
+        eeepc_raw = _json_loads_dict(eeepc_row.get('raw_json'))
         collected_payload = eeepc_raw.get('strong_reflection') if isinstance(eeepc_raw.get('strong_reflection'), dict) else None
         if collected_payload is None and isinstance(eeepc_raw.get('payloads'), dict):
             collected_payload = eeepc_raw['payloads'].get('strong_reflection') if isinstance(eeepc_raw['payloads'].get('strong_reflection'), dict) else None

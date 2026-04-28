@@ -2006,7 +2006,7 @@ def test_api_system_uses_collected_eeepc_strong_reflection_when_local_missing(tm
         'raw_json': json.dumps({
             'strong_reflection': {
                 'schema_version': 'strong-reflection-run-v1',
-                'recorded_at_utc': '2026-04-27T20:00:00+00:00',
+                'recorded_at_utc': '2999-04-27T20:00:00+00:00',
                 'summary': 'Self-evolving cycle PASS — evidence=collected-live',
                 'mode': 'strong-reflection',
                 'path': '/var/lib/eeepc-agent/self-evolving-agent/state/strong_reflection/latest.json',
