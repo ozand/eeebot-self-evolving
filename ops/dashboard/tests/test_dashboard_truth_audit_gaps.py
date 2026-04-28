@@ -960,6 +960,13 @@ def test_dashboard_apis_expose_canonical_live_proof_pointers(tmp_path: Path) -> 
         'runtime_source': {'source': 'workspace_state'},
     }
     (state_root / 'control_plane' / 'current_summary.json').write_text(json.dumps(current_summary), encoding='utf-8')
+    (state_root / 'experiments').mkdir(parents=True, exist_ok=True)
+    (state_root / 'experiments' / 'latest.json').write_text(json.dumps({
+        'experiment_id': 'exp-live-1',
+        'status': 'PASS',
+        'outcome': 'accepted',
+        'budget_used': {'requests': 2, 'tool_calls': 4, 'subagents': 1, 'elapsed_seconds': 30},
+    }), encoding='utf-8')
     request_path = state_root / 'subagents' / 'requests' / 'req-1.json'
     result_path = state_root / 'subagents' / 'results' / 'res-1.json'
     request_path.write_text(json.dumps({
