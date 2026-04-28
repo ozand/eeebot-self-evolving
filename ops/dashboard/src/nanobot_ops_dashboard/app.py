@@ -976,7 +976,6 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         and isinstance(live_feedback, dict)
         and live_feedback.get('mode') == 'retire_goal_artifact_pair'
         and live_feedback.get('retire_goal_artifact_pair') is True
-        and live_feedback.get('current_task_id') == 'record-reward'
         and live_feedback.get('selection_source') == 'feedback_pass_streak_switch'
         and _has_value(live_hadi_handoff_selected_task)
         and str(live_hadi_handoff_selected_task) in {str(live_task), str(local_task)}
@@ -2093,13 +2092,43 @@ def _reconcile_hypotheses_visibility_with_runtime(hypotheses_visibility: dict, r
     return reconciled
 
 
+def _terminal_issue_evidence_is_live(issue: dict | None) -> bool:
+    if not isinstance(issue, dict) or not issue:
+        return False
+    issue_state = str(issue.get('github_issue_state') or issue.get('state') or '').strip().upper()
+    status = str(issue.get('terminal_status') or issue.get('status') or '').strip().lower()
+    retry_allowed = issue.get('retry_allowed')
+    terminal_status = status.startswith('terminal_') or status in {'merged', 'closed', 'terminal-merged', 'terminal-closed'}
+    if issue_state == 'CLOSED' and retry_allowed is False:
+        return False
+    if terminal_status and retry_allowed is False:
+        return False
+    return True
+
+
+def _terminal_pr_evidence_is_live(pr: dict | None) -> bool:
+    if not isinstance(pr, dict) or not pr:
+        return False
+    state = str(pr.get('state') or '').strip().upper()
+    if pr.get('merged') is True or state == 'MERGED':
+        return False
+    if state == 'CLOSED':
+        return False
+    return True
+
+
 def _selected_hypothesis_terminal_evidence(cfg: DashboardConfig) -> tuple[dict | None, dict | None]:
     state_root = cfg.nanobot_repo_root / 'workspace' / 'state' / 'self_evolution'
     current_state = _json_file(state_root / 'current_state.json')
     latest_noop = _json_file(state_root / 'runtime' / 'latest_noop.json')
     issue = current_state.get('selfevo_issue') if isinstance(current_state.get('selfevo_issue'), dict) else latest_noop.get('selfevo_issue') if isinstance(latest_noop.get('selfevo_issue'), dict) else None
     pr = current_state.get('last_pr') if isinstance(current_state.get('last_pr'), dict) else latest_noop.get('pr') if isinstance(latest_noop.get('pr'), dict) else None
-    return issue, pr
+    issue_live = _terminal_issue_evidence_is_live(issue)
+    pr_live = _terminal_pr_evidence_is_live(pr)
+    pr_state = str(pr.get('state') or '').strip().upper() if isinstance(pr, dict) else ''
+    if not issue_live and pr_live and isinstance(issue, dict) and not pr_state and pr.get('merged') is not False:
+        pr_live = False
+    return issue if issue_live else None, pr if pr_live else None
 
 
 def _selected_hypothesis_diagnostics(*, cycles: list[dict], hypotheses_visibility: dict, credits_visibility: dict, cfg: DashboardConfig) -> dict:
