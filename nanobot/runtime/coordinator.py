@@ -429,7 +429,12 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
             }
             return decision
         active_task = next((task for task in task_records if (task.get("task_id") or task.get("taskId")) == current_task_id), None)
-        if active_task is not None and strong_pass_count >= GOAL_ROTATION_STREAK_LIMIT:
+        strong_pass_belongs_to_current_task = (
+            strong_pass_signature is not None
+            and len(strong_pass_signature) > 1
+            and current_task_id in set(str(value) for value in strong_pass_signature[1])
+        )
+        if active_task is not None and strong_pass_count >= GOAL_ROTATION_STREAK_LIMIT and strong_pass_belongs_to_current_task:
             if followup_task is None or not _task_is_selectable(followup_task):
                 fallback_task = _pick_task_for_classes(task_records, current_task_id, ["reflection", "execution", "verification"])
                 if fallback_task is not None:
@@ -450,7 +455,7 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
                         "selected_task_title": fallback_task.get("title") or fallback_task.get("summary") or (fallback_task.get("task_id") or fallback_task.get("taskId")),
                         "selected_task_label": _render_task_selection(fallback_task),
                     }
-            if followup_task is None:
+            if followup_task is None and not strong_pass_belongs_to_current_task:
                 return {
                     "mode": "continue_active_lane",
                     "reason": "active inspect-pass-streak review lane remains bounded when the repeated PASS signature belongs to a prior lane",
@@ -468,6 +473,29 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
                     "selected_task_title": active_task.get("title") or active_task.get("summary") or current_task_id,
                     "selected_task_label": _render_task_selection(active_task),
                 }
+        if (
+            active_task is not None
+            and followup_task is None
+            and strong_pass_signature is not None
+            and not strong_pass_belongs_to_current_task
+        ):
+            return {
+                "mode": "continue_active_lane",
+                "reason": "active inspect-pass-streak review lane remains bounded when the repeated PASS signature belongs to a prior lane",
+                "reward_value": reward_value,
+                "current_task_id": current_task_id,
+                "current_task_class": current_task_class,
+                "repeat_block_count": repeat_block_count,
+                "repeat_block_failure_class": repeat_block_failure_class,
+                "goal_artifact_signature": list(str(value) for value in strong_pass_signature) if strong_pass_signature else None,
+                "strong_pass_count": strong_pass_count,
+                "retire_goal_artifact_pair": False,
+                "selected_task_id": current_task_id,
+                "selected_task_class": _task_action_class(current_task_id),
+                "selection_source": "feedback_continue_active_lane",
+                "selected_task_title": active_task.get("title") or active_task.get("summary") or current_task_id,
+                "selected_task_label": _render_task_selection(active_task),
+            }
     elif current_task_id == SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID:
         active_task = next((task for task in task_records if (task.get("task_id") or task.get("taskId")) == current_task_id), None)
         should_materialize_synthesized_candidate = (
@@ -538,7 +566,7 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
                 "selected_task_title": active_task.get("title") or active_task.get("summary") or current_task_id,
                 "selected_task_label": _render_task_selection(active_task),
             }
-    elif current_task_id and current_task_id not in CORE_TASK_IDS:
+    if mode == "stable" and current_task_id and current_task_id not in CORE_TASK_IDS and current_task_id != "inspect-pass-streak":
         active_task = next((task for task in task_records if (task.get("task_id") or task.get("taskId")) == current_task_id), None)
         if (
             active_task is not None
@@ -561,7 +589,7 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
                 "selected_task_title": active_task.get("title") or active_task.get("summary") or current_task_id,
                 "selected_task_label": _render_task_selection(active_task),
             }
-    elif repeat_block_failure_class and repeat_block_count >= REPEATED_BLOCK_LIMIT:
+    if mode == "stable" and repeat_block_failure_class and repeat_block_count >= REPEATED_BLOCK_LIMIT:
         mode = "force_remediation"
         reason = f"repeated BLOCK on {repeat_block_failure_class}; force remediation"
         preferred_classes = ["verification", "remediation", "diagnostic"]
@@ -577,14 +605,14 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
             selection_source = "feedback_repeat_block_remediation"
         else:
             selection_source = "feedback_repeat_block_remediation"
-    elif reward_value is not None and reward_value < LOW_REWARD_THRESHOLD:
+    elif mode == "stable" and reward_value is not None and reward_value < LOW_REWARD_THRESHOLD:
         mode = "switch_task_class"
         reason = f"reward {reward_value} below threshold {LOW_REWARD_THRESHOLD}; change task class next cycle"
         preferred_classes = ["execution", "verification", "remediation"]
         selected_task = _pick_task_for_classes(task_records, current_task_id, preferred_classes)
         if selected_task is not None:
             selection_source = "feedback_low_reward_switch"
-    elif strong_pass_signature is not None and strong_pass_count >= GOAL_ROTATION_STREAK_LIMIT:
+    elif mode == "stable" and strong_pass_signature is not None and strong_pass_count >= GOAL_ROTATION_STREAK_LIMIT:
         mode = "retire_goal_artifact_pair"
         reason = "goal/artifact PASS streak reached retirement threshold; deprioritize the pair next cycle"
         if current_task_id and current_task_id not in CORE_TASK_IDS:
@@ -1320,11 +1348,22 @@ def _write_materialized_improvement_artifact(
     reward_signal: dict[str, Any] | None,
     feedback_decision: dict[str, Any] | None,
 ) -> str | None:
-    if current_task_id != "materialize-pass-streak-improvement":
+    if current_task_id not in {"materialize-pass-streak-improvement", MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID}:
         return None
     improvements_dir = state_root / "improvements"
     improvements_dir.mkdir(parents=True, exist_ok=True)
     path = improvements_dir / f"materialized-{cycle_id}.json"
+    is_synthesized_materialization = current_task_id == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+    concrete_statement = (
+        "A synthesized review lane was materialized into a concrete bounded improvement artifact."
+        if is_synthesized_materialization
+        else "A repeated PASS pattern was strong enough to justify promoting a distinct bounded execution follow-up."
+    )
+    rationale = (
+        "The system converted the synthesized candidate into an artifact so the lane can complete instead of repeating discard-only execution."
+        if is_synthesized_materialization
+        else "The system observed repeated successful cycles and converted that insight into a materialized bounded improvement artifact."
+    )
     payload = {
         "schema_version": "materialized-improvement-v1",
         "cycle_id": cycle_id,
@@ -1333,22 +1372,22 @@ def _write_materialized_improvement_artifact(
         "summary": summary,
         "reward_signal": reward_signal,
         "feedback_decision": feedback_decision,
-        "concrete_improvement_statement": "A repeated PASS pattern was strong enough to justify promoting a distinct bounded execution follow-up.",
-        "rationale": "The system observed repeated successful cycles and converted that insight into a materialized bounded improvement artifact.",
+        "concrete_improvement_statement": concrete_statement,
+        "rationale": rationale,
         "acceptance_checks": [
             "distinct materialized improvement artifact exists",
             "feedback decision references completion or follow-up semantics",
             "next bounded candidate is explicit and reviewable",
         ],
         "next_bounded_candidate": {
-            "task_id": "materialize-pass-streak-improvement",
-            "title": "Materialize one concrete bounded improvement from the repeated PASS insight",
-            "acceptance": "produce one concrete bounded follow-up candidate derived from the inspect-pass-streak review",
+            "task_id": current_task_id,
+            "title": "Materialize one bounded improvement from the synthesized candidate" if is_synthesized_materialization else "Materialize one concrete bounded improvement from the repeated PASS insight",
+            "acceptance": "write a concrete bounded improvement proposal or artifact and route it into self-evolution" if is_synthesized_materialization else "produce one concrete bounded follow-up candidate derived from the inspect-pass-streak review",
             "task_class": "execution",
         },
         "derived_candidate": {
-            "task_id": "materialize-pass-streak-improvement",
-            "title": "Materialize one concrete bounded improvement from the repeated PASS insight",
+            "task_id": current_task_id,
+            "title": "Materialize one bounded improvement from the synthesized candidate" if is_synthesized_materialization else "Materialize one concrete bounded improvement from the repeated PASS insight",
         },
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1774,6 +1813,19 @@ def _build_task_plan_snapshot(
                 status="active",
             )
         )
+    if (
+        isinstance(feedback_decision, dict)
+        and feedback_decision.get("selected_task_id") == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+        and not any(candidate.get("task_id") == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID for candidate in generated_candidates)
+    ):
+        generated_candidates.append(
+            _synthesized_materialize_improvement_candidate(
+                current_task_id=SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID,
+                strong_pass_count=int(feedback_decision.get("strong_pass_count") or 0),
+                goal_artifact_signature=feedback_decision.get("goal_artifact_signature") if isinstance(feedback_decision.get("goal_artifact_signature"), list) else None,
+                status="active",
+            )
+        )
     carried_candidates = [dict(item) for item in recorded_generated_candidates if isinstance(item, dict)] if 'recorded_generated_candidates' in locals() else []
     inferred_candidates = _inferred_generated_candidates_from_tasks(tasks)
     combined_candidates: list[dict[str, Any]] = []
@@ -1791,6 +1843,14 @@ def _build_task_plan_snapshot(
     for candidate in combined_candidates:
         if candidate.get("task_id") not in existing_ids:
             tasks.append(candidate)
+            existing_ids.add(candidate.get("task_id"))
+    if isinstance(feedback_decision, dict) and feedback_decision.get("selected_task_id") == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID:
+        for task in tasks:
+            if task.get("task_id") == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID:
+                task["status"] = "active"
+            elif task.get("status") == "active":
+                task["status"] = "pending"
+        current_task_id = MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
     if (
         current_task_id == "inspect-pass-streak"
         and (not isinstance(feedback_decision, dict) or not feedback_decision.get("selected_task_id"))
@@ -1814,18 +1874,56 @@ def _build_task_plan_snapshot(
                 "selected_task_title": followup.get("title") or followup.get("summary") or followup.get("task_id"),
                 "selected_task_label": _render_task_selection(followup),
             }
-    if current_task_id == "materialize-pass-streak-improvement" and result_status == "PASS" and materialized_improvement_artifact_path:
+    should_promote_synthesized_materialization = (
+        current_task_id == SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID
+        and experiment.get("outcome") == "discard"
+        and experiment.get("revert_status") == "skipped_no_material_change"
+    )
+    if should_promote_synthesized_materialization:
+        materialize_synthesized = next((candidate for candidate in combined_candidates if candidate.get("task_id") == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID), None)
+        if materialize_synthesized is not None and _task_is_selectable(materialize_synthesized):
+            for task in tasks:
+                if task.get("task_id") == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID:
+                    task["status"] = "active"
+                elif task.get("task_id") == SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID:
+                    task["status"] = "pending"
+                elif task.get("status") == "active":
+                    task["status"] = "pending"
+            current_task_id = MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+            feedback_decision = {
+                "mode": "materialize_synthesized_improvement",
+                "reason": "synthesized-improvement review reached repeated discard/no-artifact pressure; promote a concrete execution follow-up",
+                "reward_value": reward_signal.get("value") if isinstance(reward_signal, dict) else None,
+                "current_task_id": SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID,
+                "current_task_class": _task_action_class(SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID),
+                "repeat_block_count": 0,
+                "repeat_block_failure_class": None,
+                "goal_artifact_signature": materialize_synthesized.get("goal_artifact_signature"),
+                "strong_pass_count": materialize_synthesized.get("strong_pass_count"),
+                "retire_goal_artifact_pair": False,
+                "selected_task_id": MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID,
+                "selected_task_class": _task_action_class(MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID),
+                "selection_source": "feedback_synthesis_materialization",
+                "selected_task_title": materialize_synthesized.get("title") or MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID,
+                "selected_task_label": _render_task_selection(materialize_synthesized),
+            }
+    materialization_task_ids = {"materialize-pass-streak-improvement", MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID}
+    if current_task_id in materialization_task_ids and result_status == "PASS" and materialized_improvement_artifact_path:
+        is_synthesized_materialization = current_task_id == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+        completed_materialization_task_id = current_task_id
         for task in tasks:
-            if task.get("task_id") == "materialize-pass-streak-improvement":
+            if task.get("task_id") == completed_materialization_task_id:
                 task["status"] = "done"
-            elif task.get("task_id") == "inspect-pass-streak":
+            elif task.get("task_id") == "inspect-pass-streak" and not is_synthesized_materialization:
+                task["status"] = "done"
+            elif task.get("task_id") == SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID and is_synthesized_materialization:
                 task["status"] = "done"
             elif task.get("task_id") == "record-reward":
                 task["status"] = "active"
             elif task.get("status") == "active":
                 task["status"] = "pending"
-        combined_candidates = [candidate for candidate in combined_candidates if candidate.get("task_id") not in {"inspect-pass-streak", "materialize-pass-streak-improvement"}]
-        next_candidate = next((candidate for candidate in combined_candidates if candidate.get("task_id") == "subagent-verify-materialized-improvement"), None)
+        combined_candidates = [candidate for candidate in combined_candidates if candidate.get("task_id") not in {"inspect-pass-streak", "materialize-pass-streak-improvement", MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID}]
+        next_candidate = None if is_synthesized_materialization else next((candidate for candidate in combined_candidates if candidate.get("task_id") == "subagent-verify-materialized-improvement"), None)
         if next_candidate is not None and not isinstance(latest_failure_learning, dict):
             for task in tasks:
                 if task.get("task_id") == next_candidate.get("task_id"):
@@ -1837,8 +1935,8 @@ def _build_task_plan_snapshot(
                 "mode": "handoff_to_next_candidate",
                 "reason": "materialized lane completed and handed off to the next bounded candidate",
                 "reward_value": reward_signal.get("value") if isinstance(reward_signal, dict) else None,
-                "current_task_id": "materialize-pass-streak-improvement",
-                "current_task_class": _task_action_class("materialize-pass-streak-improvement"),
+                "current_task_id": completed_materialization_task_id,
+                "current_task_class": _task_action_class(completed_materialization_task_id),
                 "selected_task_id": next_candidate.get("task_id"),
                 "selected_task_class": _task_action_class(next_candidate.get("task_id")),
                 "selection_source": "feedback_post_completion_handoff",
