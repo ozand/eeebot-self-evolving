@@ -1032,6 +1032,16 @@ def test_dashboard_apis_expose_canonical_live_proof_pointers(tmp_path: Path) -> 
     assert experiments['runtime_parity']['schema_version'] == 'runtime-parity-v1'
     assert experiments['autonomy_verdict']['schema_version'] == 'autonomy-verdict-v1'
     assert experiments['material_progress']['schema_version'] == 'material-progress-v1'
+    assert experiments['latest'] is not None
+    assert experiments['summary']['schema_version'] == 'experiment-summary-v1'
+    assert experiments['summary']['available'] is True
+    assert isinstance(experiments['items'], list)
+
+    analytics_api = _call_json(app, '/api/analytics')
+    assert analytics_api['autonomy_verdict']['schema_version'] == 'autonomy-verdict-v1'
+    assert analytics_api['material_progress']['schema_version'] == 'material-progress-v1'
+    assert analytics_api['runtime_parity']['schema_version'] == 'runtime-parity-v1'
+    assert analytics_api['hypothesis_dynamics']['schema_version'] == 'hypothesis-dynamics-v1'
 
     subagents = _call_json(app, '/api/subagents')
     assert subagents['latest_request']['task_id'] == 'record-reward'
@@ -1121,7 +1131,292 @@ def test_hypotheses_api_exposes_local_vs_live_diagnostics_and_prefers_live_canon
     assert 'Live hypothesis 7' in body
 
 
-def test_api_system_exposes_eeepc_privileged_rollout_readiness_from_source_errors(tmp_path: Path) -> None:
+def test_dashboard_apis_hydrate_selected_hypothesis_diagnostics_and_material_progress_from_live_canonical_reports(tmp_path: Path, monkeypatch) -> None:
+    import nanobot_ops_dashboard.app as dashboard_app
+
+    project_root = tmp_path / 'dashboard'
+    repo_root = tmp_path / 'nanobot'
+    db = tmp_path / 'dashboard.sqlite3'
+    init_db(db)
+
+    state_root = repo_root / 'workspace' / 'state'
+    (state_root / 'control_plane').mkdir(parents=True, exist_ok=True)
+    (state_root / 'credits').mkdir(parents=True, exist_ok=True)
+    (state_root / 'self_evolution' / 'runtime').mkdir(parents=True, exist_ok=True)
+    _seed_hypotheses_backlog(
+        repo_root,
+        entry_count=5,
+        selected_id='materialize-synthesized-improvement',
+        selected_title='Materialize synthesized improvement',
+    )
+
+    live_report_path = '/var/lib/eeepc-agent/self-evolving-agent/state/reports/evolution-current.json'
+    live_report = {
+        'current_plan': {
+            'current_task_id': 'materialize-synthesized-improvement',
+            'current_task': 'Materialize synthesized improvement',
+            'selected_hypothesis_id': 'materialize-synthesized-improvement',
+            'selected_hypothesis_title': 'Materialize synthesized improvement',
+            'task_selection_source': 'generated_from_failure_learning',
+            'feedback_decision': {
+                'mode': 'handoff_to_next_candidate',
+                'current_task_id': 'materialize-synthesized-improvement',
+                'selected_task_id': 'materialize-synthesized-improvement',
+                'selected_task_title': 'Materialize synthesized improvement',
+                'selection_source': 'generated_from_failure_learning',
+            },
+            'budget_used': {'requests': 1, 'tool_calls': 2, 'subagents': 0, 'elapsed_seconds': 0},
+            'experiment': {
+                'outcome': 'discard',
+                'revert_status': 'skipped_no_material_change',
+                'revert_required': True,
+            },
+        },
+        'material_progress': {
+            'schema_version': 'material-progress-v1',
+            'state': 'proven',
+            'available': True,
+            'healthy_autonomy_allowed': True,
+            'proof_count': 1,
+            'proofs': [{'kind': 'accepted_experiment', 'present': True, 'reason': 'experiment_accepted'}],
+            'qualifying_proofs': ['accepted_experiment'],
+            'blocking_reason': None,
+        },
+    }
+
+    def fake_remote_file_preview(cfg, remote_path: str, max_chars: int = 800) -> dict:
+        if remote_path == live_report_path:
+            return {
+                'path': remote_path,
+                'exists': True,
+                'preview': json.dumps(live_report),
+            }
+        return {'path': remote_path, 'exists': False, 'preview': None}
+
+    monkeypatch.setattr(dashboard_app, '_remote_file_preview', fake_remote_file_preview)
+    key_path = tmp_path / 'eeepc.key'
+    key_path.write_text('test-key', encoding='utf-8')
+
+    (project_root / 'control').mkdir(parents=True, exist_ok=True)
+    (project_root / 'control' / 'current_summary.json').write_text(json.dumps({
+        'material_progress': {
+            'schema_version': 'material-progress-v1',
+            'state': 'blocked',
+            'available': True,
+            'healthy_autonomy_allowed': False,
+            'proof_count': 0,
+            'proofs': [],
+            'qualifying_proofs': [],
+            'blocking_reason': 'no_qualifying_material_progress',
+        },
+    }), encoding='utf-8')
+    (state_root / 'credits' / 'latest.json').write_text(json.dumps({
+        'reward_gate': {
+            'status': 'suppressed',
+            'reason': 'discarded_experiment_unresolved_revert',
+        },
+    }), encoding='utf-8')
+    (state_root / 'self_evolution' / 'current_state.json').write_text(json.dumps({
+        'selfevo_issue': {
+            'number': 61,
+            'title': 'Materialize synthesized improvement',
+            'url': 'https://github.com/ozand/eeebot-self-evolving/issues/61',
+        },
+        'last_pr': {
+            'number': 62,
+            'title': 'Materialized improvement follow-through',
+            'url': 'https://github.com/ozand/eeebot-self-evolving/pull/62',
+        },
+    }), encoding='utf-8')
+    (state_root / 'self_evolution' / 'runtime' / 'latest_noop.json').write_text(json.dumps({
+        'status': 'terminal_noop',
+        'selfevo_issue': {
+            'number': 61,
+            'title': 'Materialize synthesized improvement',
+            'url': 'https://github.com/ozand/eeebot-self-evolving/issues/61',
+        },
+        'pr': {
+            'number': 62,
+            'title': 'Materialized improvement follow-through',
+            'url': 'https://github.com/ozand/eeebot-self-evolving/pull/62',
+        },
+    }), encoding='utf-8')
+
+    for idx in range(5):
+        upsert_event(db, {
+            'collected_at': f'2026-04-24T13:{idx:02d}:00Z',
+            'source': 'eeepc',
+            'event_type': 'cycle',
+            'identity_key': f'cycle-live-{idx}',
+            'title': 'summary-only cycle',
+            'status': 'PASS',
+            'detail_json': json.dumps({
+                'report_source': live_report_path,
+                'artifact_paths': [live_report_path],
+            }),
+        })
+
+    insert_collection(db, {
+        'collected_at': '2026-04-24T13:05:00Z',
+        'source': 'eeepc',
+        'status': 'PASS',
+        'active_goal': 'goal-bootstrap',
+        'approval_gate': None,
+        'gate_state': None,
+        'report_source': live_report_path,
+        'outbox_source': live_report_path,
+        'artifact_paths_json': '[]',
+        'promotion_summary': None,
+        'promotion_candidate_path': None,
+        'promotion_decision_record': None,
+        'promotion_accepted_record': None,
+        'raw_json': json.dumps({'report_source': live_report_path}),
+    })
+
+    cfg = DashboardConfig(
+        project_root=project_root,
+        nanobot_repo_root=repo_root,
+        db_path=db,
+        eeepc_ssh_host='eeepc',
+        eeepc_ssh_key=key_path,
+        eeepc_state_root='/var/lib/eeepc-agent/self-evolving-agent/state',
+    )
+    app = create_app(cfg)
+
+    hypotheses = _call_json(app, '/api/hypotheses')
+    system = _call_json(app, '/api/system')
+
+    diagnostics = hypotheses['selected_hypothesis_diagnostics']
+    assert diagnostics['selected_hypothesis_id'] == 'materialize-synthesized-improvement'
+    assert diagnostics['state'] == 'stagnant'
+    assert diagnostics['run_count'] == 5
+    assert diagnostics['run_streak'] == 5
+    assert diagnostics['last_24h']['total_runs'] == 5
+    assert diagnostics['last_24h']['discard_count'] == 5
+    assert diagnostics['last_24h']['reward_gate']['status'] == 'suppressed'
+    assert diagnostics['last_24h']['reward_gate']['reason'] == 'discarded_experiment_unresolved_revert'
+
+    assert system['control_plane']['current_task'] == 'Materialize synthesized improvement'
+    assert system['control_plane']['material_progress']['state'] == 'proven'
+    assert system['control_plane']['material_progress']['healthy_autonomy_allowed'] is True
+    assert system['material_progress']['state'] == 'proven'
+    assert system['material_progress']['healthy_autonomy_allowed'] is True
+
+    assert system['autonomy_verdict']['state'] == 'stagnant'
+    assert 'hypothesis_dynamics_stagnant' in system['autonomy_verdict']['reasons']
+
+
+def test_runtime_parity_adopts_fresh_live_synthesized_materialization_when_local_task_is_stale(tmp_path: Path) -> None:
+    from nanobot_ops_dashboard.app import _dashboard_runtime_parity
+
+    repo_root = tmp_path / 'nanobot'
+    state_root = repo_root / 'workspace' / 'state'
+    for rel in [
+        'hypotheses/backlog.json',
+        'credits/latest.json',
+        'control_plane/current_summary.json',
+        'self_evolution/current_state.json',
+    ]:
+        path = state_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}', encoding='utf-8')
+    cfg = DashboardConfig(project_root=tmp_path / 'dashboard', nanobot_repo_root=repo_root, db_path=tmp_path / 'dashboard.sqlite3', eeepc_ssh_host='eeepc', eeepc_ssh_key=tmp_path / 'missing-key', eeepc_state_root='/state')
+
+    parity = _dashboard_runtime_parity(
+        {'current_task_id': 'analyze-last-failed-candidate'},
+        {
+            'current_task_id': 'materialize-synthesized-improvement',
+            'task_selection_source': 'feedback_synthesis_materialization',
+            'feedback_decision': {
+                'mode': 'materialize_synthesized_improvement',
+                'current_task_id': 'synthesize-next-improvement-candidate',
+                'selected_task_id': 'materialize-synthesized-improvement',
+                'selection_source': 'feedback_synthesis_materialization',
+            },
+        },
+        cfg,
+    )
+
+    assert parity['state'] == 'healthy'
+    assert 'current_task_drift' not in parity['reasons']
+    assert parity['canonical_current_task_id'] == 'materialize-synthesized-improvement'
+    assert parity['authority_resolution'] == 'fresh_live_synthesized_materialization'
+
+
+def test_runtime_parity_adopts_fresh_live_post_materialization_reward_when_local_task_is_stale(tmp_path: Path) -> None:
+    from nanobot_ops_dashboard.app import _dashboard_runtime_parity
+
+    repo_root = tmp_path / 'nanobot'
+    state_root = repo_root / 'workspace' / 'state'
+    for rel in [
+        'hypotheses/backlog.json',
+        'credits/latest.json',
+        'control_plane/current_summary.json',
+        'self_evolution/current_state.json',
+    ]:
+        path = state_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}', encoding='utf-8')
+    cfg = DashboardConfig(project_root=tmp_path / 'dashboard', nanobot_repo_root=repo_root, db_path=tmp_path / 'dashboard.sqlite3', eeepc_ssh_host='eeepc', eeepc_ssh_key=tmp_path / 'missing-key', eeepc_state_root='/state')
+
+    parity = _dashboard_runtime_parity(
+        {'current_task_id': 'synthesize-next-improvement-candidate'},
+        {
+            'current_task_id': 'record-reward',
+            'task_selection_source': 'feedback_synthesized_materialization_complete_reward',
+            'feedback_decision': {
+                'mode': 'record_reward_after_synthesized_materialization',
+                'current_task_id': 'record-reward',
+                'selected_task_id': 'record-reward',
+                'selection_source': 'feedback_synthesized_materialization_complete_reward',
+            },
+        },
+        cfg,
+    )
+
+    assert parity['state'] == 'healthy'
+    assert 'current_task_drift' not in parity['reasons']
+    assert parity['canonical_current_task_id'] == 'record-reward'
+    assert parity['authority_resolution'] == 'fresh_live_post_materialization_reward'
+
+
+def test_subagent_visibility_hydrates_bridge_result_report_budget_and_artifacts(tmp_path: Path) -> None:
+    repo_root = tmp_path / 'nanobot'
+    db = tmp_path / 'dashboard.sqlite3'
+    init_db(db)
+    report_path = repo_root / 'workspace' / 'state' / 'reports' / 'evolution-subagent.json'
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps({
+        'cycle_id': 'cycle-subagent',
+        'current_task_id': 'materialize-synthesized-improvement',
+        'result_status': 'PASS',
+        'budget_used': {'requests': 1, 'tool_calls': 2, 'subagents': 1, 'elapsed_seconds': 37},
+        'artifact_paths': ['/tmp/subagent-result.json'],
+    }), encoding='utf-8')
+    bridge_dir = repo_root / '.nanobot' / 'subagents'
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / 'a25ae7e7.json').write_text(json.dumps({
+        'status': 'ok',
+        'task_id': 'materialize-synthesized-improvement',
+        'cycle_id': 'cycle-subagent',
+        'report_path': str(report_path),
+        'summary': 'edited prompts/diagnostics.md',
+    }), encoding='utf-8')
+    cfg = DashboardConfig(project_root=tmp_path / 'dashboard', nanobot_repo_root=repo_root, db_path=db, eeepc_ssh_host='eeepc', eeepc_ssh_key=tmp_path / 'missing-key', eeepc_state_root='/state')
+
+    subagents = _call_json(create_app(cfg), '/api/subagents')
+
+    assert subagents['summary']['result_count'] == 1
+    latest = subagents['latest_result']
+    assert latest['task_id'] == 'materialize-synthesized-improvement'
+    assert latest['report_path'] == str(report_path)
+    assert latest['canonical_report_hydrated'] is True
+    assert latest['hydrated_report_current_task_id'] == 'materialize-synthesized-improvement'
+    assert latest['budget_used']['subagents'] == 1
+    assert latest['artifact_paths'] == ['/tmp/subagent-result.json']
+
+
+def test_eeepc_privileged_rollout_readiness_surfaces_partial_live_report_when_privileged_reads_fail(tmp_path: Path) -> None:
     project_root = tmp_path / 'dashboard'
     repo_root = tmp_path / 'nanobot'
     db = tmp_path / 'dashboard.sqlite3'

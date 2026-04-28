@@ -492,12 +492,14 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
     repo_latest = dict(repo_latest) if repo_latest else {}
     eeepc_latest = dict(eeepc_latest) if eeepc_latest else {}
     repo_raw = _json_loads_dict(repo_latest.get('raw_json')) if repo_latest else {}
+    eeepc_raw = _canonical_report_payload(cfg, _json_loads_dict(eeepc_latest.get('raw_json')) if eeepc_latest else {})
     selfevo_remote_freshness = repo_raw.get('selfevo_remote_freshness') if isinstance(repo_raw, dict) else None
     producer_summary_path = cfg.project_root / 'workspace' / 'state' / 'control_plane' / 'current_summary.json'
     if not producer_summary_path.exists():
         alt_summary_path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'control_plane' / 'current_summary.json'
         producer_summary_path = alt_summary_path if alt_summary_path.exists() else producer_summary_path
     producer_summary = _structured_file_payload(producer_summary_path) if producer_summary_path.exists() else {}
+    producer_summary = _canonical_report_payload(cfg, producer_summary) if isinstance(producer_summary, dict) else {}
     guarded_state_path = cfg.nanobot_repo_root / 'workspace' / 'state' / 'self_evolution' / 'current_state.json'
     guarded_evolution = _structured_file_payload(guarded_state_path) if guarded_state_path.exists() else {}
     if isinstance(guarded_evolution, dict) and selfevo_remote_freshness is not None:
@@ -540,7 +542,14 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
         governance_enforcement = {'state': 'pending', 'reason': 'completion_unverified'}
     else:
         governance_enforcement = {'state': 'open', 'reason': 'no_verified_terminal_completion'}
-    producer_task_truth = _task_plan_truth(producer_summary.get('task_plan') if isinstance(producer_summary, dict) else None)
+    producer_task_source = (
+        producer_summary.get('task_plan') if isinstance(producer_summary, dict) and isinstance(producer_summary.get('task_plan'), dict) else None
+        or eeepc_raw.get('task_plan') if isinstance(eeepc_raw, dict) and isinstance(eeepc_raw.get('task_plan'), dict) else None
+        or eeepc_raw.get('current_plan') if isinstance(eeepc_raw, dict) and isinstance(eeepc_raw.get('current_plan'), dict) else None
+        or eeepc_raw.get('currentPlan') if isinstance(eeepc_raw, dict) and isinstance(eeepc_raw.get('currentPlan'), dict) else None
+        or eeepc_raw.get('plan') if isinstance(eeepc_raw, dict) and isinstance(eeepc_raw.get('plan'), dict) else None
+    )
+    producer_task_truth = _task_plan_truth(producer_task_source)
     producer_current_task = producer_task_truth.get('current_task')
     experiment_source = producer_summary.get('experiment') if isinstance(producer_summary, dict) and producer_summary.get('experiment') else current_experiment
     experiment_truth = _experiment_truth_summary(experiment_source)
@@ -581,7 +590,7 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
         'prompt_mass': (producer_summary.get('prompt_mass') if isinstance(producer_summary, dict) else None),
         'owner_utility': (producer_summary.get('owner_utility') if isinstance(producer_summary, dict) else None),
         'subagent_rollup': (repo_raw.get('subagent_rollup') if isinstance(repo_raw, dict) else None) or (producer_summary.get('subagent_rollup') if isinstance(producer_summary, dict) else None),
-        'material_progress': _material_progress_summary((repo_raw.get('material_progress') if isinstance(repo_raw, dict) else None) or (producer_summary.get('material_progress') if isinstance(producer_summary, dict) else None)),
+        'material_progress': _material_progress_summary((repo_raw.get('material_progress') if isinstance(repo_raw, dict) else None) or (eeepc_raw.get('material_progress') if isinstance(eeepc_raw, dict) else None) or (producer_summary.get('material_progress') if isinstance(producer_summary, dict) else None)),
         'human_review_boundary': human_review_boundary,
         'governance_enforcement': governance_enforcement,
         'launch_criteria': {
@@ -711,17 +720,31 @@ def _discover_subagent_requests(cfg: DashboardConfig, stale_after_seconds: int =
     results_by_request_path: dict[str, dict] = {}
     results_by_cycle_id: dict[str, dict] = {}
     results_by_task_id: dict[str, dict] = {}
-    if result_dir.exists():
-        for path in sorted(result_dir.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True):
+    result_dirs = [result_dir, cfg.nanobot_repo_root / '.nanobot' / 'subagents']
+    for current_result_dir in result_dirs:
+        if not current_result_dir.exists():
+            continue
+        for path in sorted(current_result_dir.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True):
             payload = _json_file(path)
+            hydrated_report = _canonical_report_payload(cfg, {'report_source': payload.get('report_path') or payload.get('report_source')}) if (payload.get('report_path') or payload.get('report_source')) else {}
+            hydrated_budget = hydrated_report.get('budget_used') if isinstance(hydrated_report.get('budget_used'), dict) else None
+            follow_through = hydrated_report.get('follow_through') if isinstance(hydrated_report.get('follow_through'), dict) else {}
+            hydrated_artifacts = hydrated_report.get('artifact_paths') or follow_through.get('artifact_paths')
             result = {
                 'path': str(path),
                 'request_path': payload.get('request_path'),
-                'task_id': payload.get('task_id'),
-                'cycle_id': payload.get('cycle_id'),
+                'report_path': payload.get('report_path') or payload.get('report_source'),
+                'task_id': payload.get('task_id') or hydrated_report.get('current_task_id'),
+                'cycle_id': payload.get('cycle_id') or hydrated_report.get('cycle_id'),
                 'status': payload.get('status') or payload.get('result_status') or 'completed',
                 'terminal_reason': payload.get('terminal_reason') or payload.get('reason'),
+                'summary': payload.get('summary'),
                 'age_seconds': max(0, int(now - path.stat().st_mtime)),
+                'hydrated_report_current_task_id': hydrated_report.get('current_task_id'),
+                'hydrated_report_result_status': hydrated_report.get('result_status') or hydrated_report.get('status'),
+                'budget_used': hydrated_budget,
+                'artifact_paths': hydrated_artifacts,
+                'canonical_report_hydrated': bool(hydrated_report),
             }
             results.append(result)
             if result.get('request_path'):
@@ -900,7 +923,7 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         and str(live_hadi_handoff_selected_task) == str(live_task)
         and bool(live_feedback.get('terminal_selfevo_issue'))
     )
-    live_active_lane_continue = (
+    live_active_lane = (
         all(artifacts.values())
         and isinstance(live_feedback, dict)
         and live_feedback.get('mode') == 'continue_active_lane'
@@ -910,6 +933,21 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         and _has_value(live_feedback.get('current_task_id'))
         and str(live_feedback.get('current_task_id')) == str(live_task)
         and 'record-reward' not in str(live_task or '')
+    )
+    live_synthesized_materialization = (
+        isinstance(live_feedback, dict)
+        and live_feedback.get('mode') == 'materialize_synthesized_improvement'
+        and live_feedback.get('selection_source') == 'feedback_synthesis_materialization'
+        and _has_value(live_feedback.get('selected_task_id'))
+        and str(live_feedback.get('selected_task_id')) == str(live_task)
+    )
+    live_post_materialization_reward = (
+        isinstance(live_feedback, dict)
+        and live_feedback.get('mode') == 'record_reward_after_synthesized_materialization'
+        and live_feedback.get('selection_source') == 'feedback_synthesized_materialization_complete_reward'
+        and _has_value(live_feedback.get('selected_task_id'))
+        and str(live_feedback.get('selected_task_id')) == 'record-reward'
+        and str(live_task or '') == 'record-reward'
     )
     local_complete_lane_failure_repair = (
         all(artifacts.values())
@@ -941,8 +979,14 @@ def _dashboard_runtime_parity(repo_plan: dict | None, eeepc_plan: dict | None, c
         elif live_terminal_selfevo_retire:
             authority_resolution = 'fresh_live_terminal_selfevo_retire'
             canonical_task = live_task
-        elif live_active_lane_continue:
+        elif live_active_lane:
             authority_resolution = 'fresh_live_active_lane'
+            canonical_task = live_task
+        elif live_synthesized_materialization:
+            authority_resolution = 'fresh_live_synthesized_materialization'
+            canonical_task = live_task
+        elif live_post_materialization_reward:
+            authority_resolution = 'fresh_live_post_materialization_reward'
             canonical_task = live_task
         elif local_complete_lane_failure_repair and live_stale_complete_lane_reward:
             authority_resolution = 'local_failure_learning_repair_over_stale_live_complete_lane'
@@ -1515,6 +1559,20 @@ def _discover_experiment_visibility(cfg: DashboardConfig, plan_latest: dict | No
     if current_budget is None and current_experiment and current_experiment.get('budget'):
         current_budget = current_experiment
 
+    latest = current_experiment or current_budget or (experiment_history[0] if experiment_history else None) or (budget_history[0] if budget_history else None)
+    summary = {
+        'schema_version': 'experiment-summary-v1',
+        'available': bool(latest),
+        'latest_experiment_id': latest.get('experiment_id') if isinstance(latest, dict) else None,
+        'latest_title': latest.get('title') if isinstance(latest, dict) else None,
+        'latest_status': latest.get('status') if isinstance(latest, dict) else None,
+        'latest_outcome': latest.get('outcome') if isinstance(latest, dict) else None,
+        'reward_source': reward_source,
+        'current_reward_text': reward_text,
+        'experiment_count': len(experiment_history),
+        'budget_count': len(budget_history),
+    }
+    items = experiment_history[:10] if experiment_history else budget_history[:10]
     return {
         'available': bool(experiment_history or current_budget),
         'state_roots': [str(root) for root in state_roots],
@@ -1523,6 +1581,9 @@ def _discover_experiment_visibility(cfg: DashboardConfig, plan_latest: dict | No
         'budget_history': budget_history[:10],
         'current_experiment': current_experiment,
         'current_budget': current_budget,
+        'latest': latest,
+        'summary': summary,
+        'items': items,
         'current_reward_signal': reward_signal,
         'current_reward_text': reward_text,
         'reward_source': reward_source,
@@ -1902,43 +1963,9 @@ def _selected_hypothesis_diagnostics(*, cycles: list[dict], hypotheses_visibilit
                 ordered_candidates.append(normalized)
         return ordered_candidates
 
-    def _resolve_report_source_path(report_source: str) -> Path | None:
-        if not _has_value(report_source):
-            return None
-        text = str(report_source).strip()
-        stripped = text.lstrip('/\\')
-        candidates = [Path(text)]
-        if stripped:
-            candidates.extend([
-                cfg.nanobot_repo_root / stripped,
-                cfg.project_root / stripped,
-            ])
-        for path in candidates:
-            try:
-                if path.exists():
-                    return path
-            except Exception:
-                continue
-        return None
-
     def _hydrate_cycle_detail(row: dict) -> dict:
         detail = dict(row.get('detail')) if isinstance(row.get('detail'), dict) else {}
-        hydrated = dict(detail)
-        for report_source in _report_source_candidates(detail):
-            path = _resolve_report_source_path(report_source)
-            if path is None:
-                continue
-            payload = _json_file(path)
-            if not isinstance(payload, dict):
-                continue
-            hydrated.setdefault('report_source', report_source)
-            hydrated.setdefault('report_source_path', str(path))
-            hydrated.update(payload)
-            for key in ('current_plan', 'currentPlan', 'task_plan', 'taskPlan', 'plan'):
-                nested = payload.get(key)
-                if isinstance(nested, dict):
-                    hydrated.update(nested)
-            break
+        hydrated = _canonical_report_payload(cfg, detail)
         return hydrated
 
     def _matches_selected(row: dict) -> bool:
@@ -2454,6 +2481,57 @@ def _remote_file_preview(cfg: DashboardConfig, remote_path: str, max_chars: int 
 
 
 
+def _canonical_report_payload(cfg: DashboardConfig, payload: dict | None) -> dict:
+    hydrated = dict(payload) if isinstance(payload, dict) else {}
+    report_sources: list[str] = []
+    for key in ('report_source', 'reportSource', 'report_path', 'reportPath', 'source_path', 'sourcePath'):
+        value = hydrated.get(key)
+        if _has_value(value):
+            report_sources.append(str(value))
+    seen: set[str] = set()
+    for report_source in report_sources:
+        normalized = report_source.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        source_payload = _json_file(Path(normalized))
+        if not source_payload:
+            stripped = normalized.lstrip('/\\')
+            for candidate in (
+                cfg.nanobot_repo_root / stripped,
+                cfg.project_root / stripped,
+            ):
+                try:
+                    if candidate.exists():
+                        source_payload = _json_file(candidate)
+                        if source_payload:
+                            hydrated.setdefault('report_source_path', str(candidate))
+                            break
+                except Exception:
+                    continue
+        if not source_payload and cfg.eeepc_ssh_key.exists():
+            remote = _remote_file_preview(cfg, normalized, max_chars=50000)
+            preview = remote.get('preview')
+            if remote.get('exists') and isinstance(preview, str):
+                try:
+                    parsed_preview = json.loads(preview)
+                except Exception:
+                    parsed_preview = None
+                if isinstance(parsed_preview, dict):
+                    source_payload = parsed_preview
+                    hydrated.setdefault('report_source_path', remote.get('path'))
+        if source_payload:
+            hydrated.setdefault('report_source', normalized)
+            hydrated.update(source_payload)
+            for key in ('current_plan', 'currentPlan', 'task_plan', 'taskPlan', 'plan', 'outbox', 'material_progress'):
+                nested = source_payload.get(key)
+                if isinstance(nested, dict):
+                    hydrated.update(nested)
+            break
+    return hydrated
+
+
+
 def _discover_system_visibility(cfg: DashboardConfig, eeepc_latest, repo_latest) -> dict:
     repo_root = cfg.nanobot_repo_root
     local_files = [
@@ -2588,7 +2666,7 @@ def create_app(cfg: DashboardConfig):
         subagent_visibility = _discover_subagent_requests(cfg)
         runtime_parity = _dashboard_runtime_parity(repo_plan_snapshot or plan_latest, eeepc_plan_snapshot, cfg)
         runtime_authority_resolution = runtime_parity.get('authority_resolution') if isinstance(runtime_parity, dict) else None
-        authoritative_plan_latest = eeepc_plan_snapshot if runtime_authority_resolution in {'fresh_live_terminal_selfevo_retire', 'fresh_live_active_lane'} and eeepc_plan_snapshot else plan_latest
+        authoritative_plan_latest = eeepc_plan_snapshot if runtime_authority_resolution in {'fresh_live_terminal_selfevo_retire', 'fresh_live_active_lane', 'fresh_live_synthesized_materialization', 'fresh_live_post_materialization_reward'} and eeepc_plan_snapshot else plan_latest
         eeepc_privileged_rollout_readiness = _eeepc_privileged_rollout_readiness(eeepc_latest, runtime_parity)
         subagent_latest_event = all_subagent_events[0] if all_subagent_events else None
         latest_collected = None
@@ -2992,7 +3070,7 @@ def create_app(cfg: DashboardConfig):
                 and 'current_task_drift' not in runtime_reasons
                 and (
                     'legacy_live_reward_loop_current_task' in runtime_reasons
-                    or runtime_authority_resolution in {'fresh_live_terminal_selfevo_retire', 'fresh_live_active_lane'}
+                    or runtime_authority_resolution in {'fresh_live_terminal_selfevo_retire', 'fresh_live_active_lane', 'fresh_live_synthesized_materialization', 'fresh_live_post_materialization_reward'}
                     or runtime_canonical_task_id in str(canonical_current_task or '')
                     or runtime_canonical_task_id == _selected_task_id(task_truth.get('selected_tasks'))
                 )
@@ -3021,7 +3099,7 @@ def create_app(cfg: DashboardConfig):
                 ):
                     value = visible_plan_latest.get(source_key)
                     if _has_value(value) and value != 'unknown':
-                        if runtime_authority_resolution in {'fresh_live_terminal_selfevo_retire', 'fresh_live_active_lane'}:
+                        if runtime_authority_resolution in {'fresh_live_terminal_selfevo_retire', 'fresh_live_active_lane', 'fresh_live_synthesized_materialization', 'fresh_live_post_materialization_reward'}:
                             canonical_task_plan[target_key] = value
                         else:
                             canonical_task_plan.setdefault(target_key, value)
@@ -3068,6 +3146,9 @@ def create_app(cfg: DashboardConfig):
                 'budget_history': experiment_visibility['budget_history'],
                 'candidate_files': experiment_visibility['candidate_files'],
                 'state_roots': experiment_visibility['state_roots'],
+                'latest': experiment_visibility.get('latest'),
+                'summary': experiment_visibility.get('summary'),
+                'items': experiment_visibility.get('items'),
                 'credits': credits_visibility,
                 'empty_state_reason': experiment_visibility['empty_state_reason'],
                 'material_progress': _material_progress_summary(control_plane.get('material_progress') if isinstance(control_plane, dict) else None),
@@ -3151,7 +3232,14 @@ def create_app(cfg: DashboardConfig):
             return [body]
 
         if path == '/api/analytics':
-            body = json.dumps({'analytics': analytics, 'current_blocker': current_blocker}, ensure_ascii=False, indent=2).encode('utf-8')
+            body = json.dumps({
+                'analytics': analytics,
+                'current_blocker': current_blocker,
+                'autonomy_verdict': autonomy_verdict,
+                'material_progress': material_progress,
+                'runtime_parity': runtime_parity,
+                'hypothesis_dynamics': hypothesis_dynamics,
+            }, ensure_ascii=False, indent=2).encode('utf-8')
             start_response('200 OK', [('Content-Type', 'application/json; charset=utf-8')])
             return [body]
 
