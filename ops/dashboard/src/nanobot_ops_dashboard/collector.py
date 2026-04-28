@@ -1088,7 +1088,6 @@ def _normalize_eeepc_state(cfg: DashboardConfig) -> dict[str, Any]:
         plan_source,
         source_errors or None,
     )
-    eeepc_subagent_records = _load_ssh_subagent_telemetry(cfg, state_root)
     if eeepc_subagent_records:
         normalized['events'] = (normalized.get('events') or []) + _subagent_events_from_records(eeepc_subagent_records)
         normalized['raw']['subagents'] = eeepc_subagent_records
