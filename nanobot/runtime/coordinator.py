@@ -654,15 +654,34 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
                     selection_source = "feedback_pass_streak_switch"
                     break
         if selected_task is None:
-            mode = "synthesize_next_candidate"
-            reason = "goal/artifact PASS retirement pressure reached with no selectable bounded lane; synthesize a new bounded improvement candidate"
-            selected_task = _synthesized_next_improvement_candidate(
-                current_task_id=current_task_id,
-                strong_pass_count=strong_pass_count,
-                goal_artifact_signature=list(str(value) for value in strong_pass_signature) if strong_pass_signature else None,
-                status="active",
+            synthesized_parent_completed = any(
+                (task.get("task_id") or task.get("taskId")) == SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID
+                and not _task_is_selectable(task)
+                for task in task_records
             )
-            selection_source = "feedback_no_selectable_retired_lane_synthesis"
+            synthesized_materialization_completed = any(
+                (task.get("task_id") or task.get("taskId")) == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+                and not _task_is_selectable(task)
+                for task in task_records
+            )
+            if synthesized_parent_completed and synthesized_materialization_completed:
+                selected_task = next(
+                    (task for task in task_records if (task.get("task_id") or task.get("taskId")) == "record-reward"),
+                    {"task_id": "record-reward", "title": "Record cycle reward", "status": "active"},
+                )
+                mode = "record_reward_after_synthesized_materialization"
+                reason = "synthesized candidate and its materialization artifact are complete; return to reward accounting instead of replaying the parent review lane"
+                selection_source = "feedback_synthesized_materialization_complete_reward"
+            else:
+                mode = "synthesize_next_candidate"
+                reason = "goal/artifact PASS retirement pressure reached with no selectable bounded lane; synthesize a new bounded improvement candidate"
+                selected_task = _synthesized_next_improvement_candidate(
+                    current_task_id=current_task_id,
+                    strong_pass_count=strong_pass_count,
+                    goal_artifact_signature=list(str(value) for value in strong_pass_signature) if strong_pass_signature else None,
+                    status="active",
+                )
+                selection_source = "feedback_no_selectable_retired_lane_synthesis"
 
     decision = {
         "mode": mode,
@@ -1908,6 +1927,15 @@ def _build_task_plan_snapshot(
                 "selected_task_label": _render_task_selection(materialize_synthesized),
             }
     materialization_task_ids = {"materialize-pass-streak-improvement", MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID}
+    materialized_artifact_task_id = None
+    if materialized_improvement_artifact_path:
+        materialized_artifact_payload = _safe_read_json(Path(materialized_improvement_artifact_path))
+        if isinstance(materialized_artifact_payload, dict) and materialized_artifact_payload.get("task_id") in materialization_task_ids:
+            materialized_artifact_task_id = materialized_artifact_payload.get("task_id")
+    if materialized_artifact_task_id in materialization_task_ids:
+        artifact_task_record = next((task for task in tasks if task.get("task_id") == materialized_artifact_task_id), None)
+        if _task_is_selectable(artifact_task_record):
+            current_task_id = materialized_artifact_task_id
     if current_task_id in materialization_task_ids and result_status == "PASS" and materialized_improvement_artifact_path:
         is_synthesized_materialization = current_task_id == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
         completed_materialization_task_id = current_task_id
@@ -1987,8 +2015,8 @@ def _build_task_plan_snapshot(
                     "mode": "retire_terminal_selfevo_lane",
                     "reason": "latest self-evolution issue reached a terminal merged/closed or terminal no-op state; do not recreate analyze-last-failed-candidate",
                     "reward_value": reward_signal.get("value") if isinstance(reward_signal, dict) else None,
-                    "current_task_id": "materialize-pass-streak-improvement",
-                    "current_task_class": _task_action_class("materialize-pass-streak-improvement"),
+                    "current_task_id": completed_materialization_task_id,
+                    "current_task_class": _task_action_class(completed_materialization_task_id),
                     "selected_task_id": "record-reward",
                     "selected_task_class": _task_action_class("record-reward"),
                     "selection_source": completion_selection_source,
@@ -2001,8 +2029,8 @@ def _build_task_plan_snapshot(
                     "mode": "complete_active_lane",
                     "reason": completion_reason,
                     "reward_value": reward_signal.get("value") if isinstance(reward_signal, dict) else None,
-                    "current_task_id": "materialize-pass-streak-improvement",
-                    "current_task_class": _task_action_class("materialize-pass-streak-improvement"),
+                    "current_task_id": completed_materialization_task_id,
+                    "current_task_class": _task_action_class(completed_materialization_task_id),
                     "selected_task_id": completion_target_id,
                     "selected_task_class": _task_action_class(completion_target_id),
                     "selection_source": completion_selection_source,
@@ -2895,6 +2923,16 @@ async def run_self_evolving_cycle(
             encoding="utf-8",
         )
 
+    artifact_current_task_id = experiment.get("current_task_id")
+    if isinstance(recorded_task_plan, dict):
+        recorded_current_task_id = recorded_task_plan.get("current_task_id") or recorded_task_plan.get("currentTaskId")
+        recorded_feedback = recorded_task_plan.get("feedback_decision") if isinstance(recorded_task_plan.get("feedback_decision"), dict) else {}
+        if (
+            recorded_current_task_id == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+            or recorded_feedback.get("selected_task_id") == MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+        ):
+            artifact_current_task_id = MATERIALIZE_SYNTHESIZED_IMPROVEMENT_ID
+
     current_plan = _build_task_plan_snapshot(
         workspace=workspace,
         cycle_id=cycle_id,
@@ -2912,7 +2950,7 @@ async def run_self_evolving_cycle(
             state_root=state_root,
             cycle_id=cycle_id,
             goal_id=active_goal,
-            current_task_id=experiment.get("current_task_id"),
+            current_task_id=artifact_current_task_id,
             summary=summary,
             reward_signal=reward_signal,
             feedback_decision=feedback_decision,
