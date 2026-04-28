@@ -359,6 +359,143 @@ def test_dashboard_current_task_authority_prefers_local_producer_over_legacy_liv
     assert plan['task_plan']['current_task_id'] == 'analyze-last-failed-candidate'
 
 
+def test_dashboard_runtime_parity_trusts_fresh_live_failure_learning_handoff_and_reconciles_plan_and_hypotheses(tmp_path: Path) -> None:
+    project_root = tmp_path / 'dashboard'
+    repo_root = tmp_path / 'nanobot'
+    db = tmp_path / 'dashboard.sqlite3'
+    init_db(db)
+    state_root = repo_root / 'workspace' / 'state'
+    for rel in [
+        'hypotheses/backlog.json',
+        'credits/latest.json',
+        'control_plane/current_summary.json',
+        'self_evolution/current_state.json',
+    ]:
+        path = state_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if rel == 'hypotheses/backlog.json':
+            continue
+        path.write_text('{}', encoding='utf-8')
+
+    _seed_hypotheses_backlog(
+        repo_root,
+        entry_count=3,
+        selected_id='record-reward',
+        selected_title='Record cycle reward',
+    )
+    (state_root / 'control_plane' / 'current_summary.json').write_text(json.dumps({
+        'task_plan': {
+            'current_task_id': 'record-reward',
+            'current_task': 'Record cycle reward',
+            'selected_tasks': 'Record cycle reward [task_id=record-reward]',
+            'task_selection_source': 'recorded_current_task',
+            'feedback_decision': {
+                'mode': 'force_remediation',
+                'selected_task_id': 'record-reward',
+                'selected_task_title': 'Record cycle reward',
+                'selection_source': 'recorded_current_task',
+            },
+        },
+        'runtime_source': {'source': 'workspace_state'},
+    }), encoding='utf-8')
+
+    repo_raw = {
+        'current_plan': {
+            'current_task_id': 'record-reward',
+            'current_task': 'Record cycle reward',
+            'selected_tasks': 'Record cycle reward [task_id=record-reward]',
+            'task_selection_source': 'recorded_current_task',
+            'feedback_decision': {
+                'mode': 'force_remediation',
+                'selected_task_id': 'record-reward',
+                'selected_task_title': 'Record cycle reward',
+                'selection_source': 'recorded_current_task',
+            },
+        },
+        'outbox': {'status': 'PASS'},
+    }
+    live_raw = {
+        'current_plan': {
+            'current_task_id': 'analyze-last-failed-candidate',
+            'current_task': 'Analyze the last failed self-evolution candidate before retrying mutation',
+            'selected_tasks': 'Analyze the last failed self-evolution candidate [task_id=analyze-last-failed-candidate]',
+            'task_selection_source': 'generated_from_failure_learning',
+            'feedback_decision': {
+                'mode': 'complete_active_lane',
+                'selected_task_id': 'analyze-last-failed-candidate',
+                'selected_task_title': 'Analyze the last failed self-evolution candidate before retrying mutation',
+                'selection_source': 'feedback_complete_active_lane_to_failure_learning',
+            },
+        },
+        'outbox': {'status': 'PASS'},
+    }
+    insert_collection(db, {
+        'collected_at': '2026-04-24T07:30:00Z',
+        'source': 'repo',
+        'status': 'PASS',
+        'active_goal': 'goal-bootstrap',
+        'approval_gate': None,
+        'gate_state': None,
+        'report_source': '/workspace/state/reports/evolution-current.json',
+        'outbox_source': '/workspace/state/outbox/report.index.json',
+        'artifact_paths_json': '[]',
+        'promotion_summary': None,
+        'promotion_candidate_path': None,
+        'promotion_decision_record': None,
+        'promotion_accepted_record': None,
+        'raw_json': json.dumps(repo_raw),
+    })
+    insert_collection(db, {
+        'collected_at': '2026-04-24T07:31:00Z',
+        'source': 'eeepc',
+        'status': 'PASS',
+        'active_goal': 'goal-bootstrap',
+        'approval_gate': None,
+        'gate_state': None,
+        'report_source': '/workspace/state/reports/evolution-current.json',
+        'outbox_source': '/workspace/state/outbox/report.index.json',
+        'artifact_paths_json': '[]',
+        'promotion_summary': None,
+        'promotion_candidate_path': None,
+        'promotion_decision_record': None,
+        'promotion_accepted_record': None,
+        'raw_json': json.dumps(live_raw),
+    })
+
+    cfg = DashboardConfig(
+        project_root=project_root,
+        nanobot_repo_root=repo_root,
+        db_path=db,
+        eeepc_ssh_host='eeepc',
+        eeepc_ssh_key=tmp_path / 'missing-key',
+        eeepc_state_root='/state',
+    )
+    app = create_app(cfg)
+
+    system = _call_json(app, '/api/system')
+    parity = system['runtime_parity']
+    assert parity['state'] == 'healthy'
+    assert parity['local_current_task_id'] == 'record-reward'
+    assert parity['live_current_task_id'] == 'analyze-last-failed-candidate'
+    assert parity['canonical_current_task_id'] == 'analyze-last-failed-candidate'
+    assert parity['authority_resolution'] == 'fresh_live_failure_learning_handoff'
+    assert 'current_task_drift' not in parity['reasons']
+
+    plan = _call_json(app, '/api/plan')
+    assert plan['current_task_id'] == 'analyze-last-failed-candidate'
+    assert plan['task_plan']['current_task_id'] == 'analyze-last-failed-candidate'
+    assert plan['task_plan']['task_selection_source'] == 'generated_from_failure_learning'
+    assert plan['feedback_decision']['selection_source'] == 'feedback_complete_active_lane_to_failure_learning'
+
+    hypotheses = _call_json(app, '/api/hypotheses')
+    assert hypotheses['selected_hypothesis_id'] == 'analyze-last-failed-candidate'
+    assert hypotheses['selected_hypothesis_title'] == 'Analyze the last failed self-evolution candidate before retrying mutation'
+    diagnostics = hypotheses['selected_hypothesis_diagnostics']
+    assert diagnostics['selected_hypothesis_id'] == 'analyze-last-failed-candidate'
+    assert diagnostics['canonical_runtime_task_id'] == 'analyze-last-failed-candidate'
+    assert diagnostics['canonical_runtime_authority_resolution'] == 'fresh_live_failure_learning_handoff'
+
+
 def test_api_plan_embeds_canonical_current_task_id_when_producer_task_plan_missing(tmp_path: Path) -> None:
     project_root = tmp_path / 'dashboard'
     repo_root = tmp_path / 'nanobot'
@@ -1845,6 +1982,81 @@ def test_strong_reflection_freshness_falls_back_to_live_eeepc_artifact(tmp_path:
     assert result['source'] == 'eeepc'
     assert result['path'] == '/var/lib/eeepc-agent/self-evolving-agent/state/strong_reflection/latest.json'
     assert result['summary'].endswith('live')
+
+
+def test_api_system_uses_collected_eeepc_strong_reflection_when_local_missing(tmp_path: Path) -> None:
+    project_root = tmp_path / 'dashboard'
+    repo_root = tmp_path / 'nanobot'
+    db = tmp_path / 'dashboard.sqlite3'
+    init_db(db)
+    insert_collection(db, {
+        'collected_at': '2026-04-27T21:00:00Z',
+        'source': 'eeepc',
+        'status': 'PASS',
+        'active_goal': 'goal-bootstrap',
+        'approval_gate': None,
+        'gate_state': None,
+        'report_source': '/state/reports/evolution-live.json',
+        'outbox_source': '/state/outbox/report.index.json',
+        'artifact_paths_json': '[]',
+        'promotion_summary': None,
+        'promotion_candidate_path': None,
+        'promotion_decision_record': None,
+        'promotion_accepted_record': None,
+        'raw_json': json.dumps({
+            'strong_reflection': {
+                'schema_version': 'strong-reflection-run-v1',
+                'recorded_at_utc': '2026-04-27T20:00:00+00:00',
+                'summary': 'Self-evolving cycle PASS — evidence=collected-live',
+                'mode': 'strong-reflection',
+                'path': '/var/lib/eeepc-agent/self-evolving-agent/state/strong_reflection/latest.json',
+            }
+        }),
+    })
+    cfg = DashboardConfig(
+        project_root=project_root,
+        nanobot_repo_root=repo_root,
+        db_path=db,
+        eeepc_ssh_host='eeepc',
+        eeepc_ssh_key=tmp_path / 'missing-key',
+        eeepc_state_root='/var/lib/eeepc-agent/self-evolving-agent/state',
+    )
+
+    system = _call_json(create_app(cfg), '/api/system')
+
+    freshness = system['strong_reflection_freshness']
+    assert freshness['available'] is True
+    assert freshness['state'] == 'fresh'
+    assert freshness['source'] == 'eeepc'
+    assert freshness['summary'].endswith('collected-live')
+
+
+def test_autonomy_verdict_flags_blocked_pending_promotion_lifecycle(tmp_path: Path) -> None:
+    from nanobot_ops_dashboard.app import _autonomy_verdict
+
+    cfg = DashboardConfig(project_root=tmp_path / 'dashboard', nanobot_repo_root=tmp_path / 'repo', db_path=tmp_path / 'dashboard.sqlite3', eeepc_ssh_host='eeepc', eeepc_ssh_key=tmp_path / 'missing', eeepc_state_root='/state')
+    verdict = _autonomy_verdict(
+        analytics={'recent_status_sequence': [], 'current_streak': {'status': 'PASS', 'length': 3}},
+        plan_latest={'current_task_id': 'synthesize-next-improvement-candidate'},
+        experiment_visibility={'current_experiment': {'outcome': 'keep'}},
+        credits_visibility={'current': {'delta': 1.0}},
+        cfg=cfg,
+        material_progress={'state': 'proven', 'healthy_autonomy_allowed': True},
+        runtime_parity={'state': 'healthy', 'canonical_current_task_id': 'synthesize-next-improvement-candidate', 'local_current_task_id': 'synthesize-next-improvement-candidate', 'live_current_task_id': 'synthesize-next-improvement-candidate', 'reasons': []},
+        hypothesis_dynamics={'state': 'healthy'},
+        promotion_replay_readiness={
+            'state': 'blocked',
+            'reason': 'not_accepted',
+            'review_status': 'pending_policy_review',
+            'decision': 'pending_policy_review',
+            'decision_record': None,
+            'accepted_record': None,
+        },
+    )
+
+    assert verdict['state'] == 'stagnant'
+    assert 'promotion_lifecycle_blocked' in verdict['reasons']
+    assert verdict['promotion_replay_readiness']['state'] == 'blocked'
 
 
 def test_remote_file_preview_kill_switch_avoids_request_time_ssh(tmp_path: Path, monkeypatch) -> None:
