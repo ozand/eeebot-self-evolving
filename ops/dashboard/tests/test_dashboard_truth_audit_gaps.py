@@ -1387,6 +1387,42 @@ def test_runtime_parity_adopts_fresh_live_post_materialization_reward_when_local
     assert parity['authority_resolution'] == 'fresh_live_post_materialization_reward'
 
 
+def test_runtime_parity_adopts_fresh_live_synthesized_candidate_after_reward_rotation_when_local_task_is_stale(tmp_path: Path) -> None:
+    from nanobot_ops_dashboard.app import _dashboard_runtime_parity
+
+    repo_root = tmp_path / 'nanobot'
+    state_root = repo_root / 'workspace' / 'state'
+    for rel in [
+        'hypotheses/backlog.json',
+        'credits/latest.json',
+        'control_plane/current_summary.json',
+        'self_evolution/current_state.json',
+    ]:
+        path = state_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}', encoding='utf-8')
+    cfg = DashboardConfig(project_root=tmp_path / 'dashboard', nanobot_repo_root=repo_root, db_path=tmp_path / 'dashboard.sqlite3', eeepc_ssh_host='eeepc', eeepc_ssh_key=tmp_path / 'missing-key', eeepc_state_root='/state')
+
+    parity = _dashboard_runtime_parity(
+        {'current_task_id': 'record-reward'},
+        {
+            'current_task_id': 'synthesize-next-improvement-candidate',
+            'feedback_decision': {
+                'mode': 'synthesize_next_candidate',
+                'selection_source': 'feedback_no_selectable_retired_lane_synthesis',
+                'selected_task_id': 'synthesize-next-improvement-candidate',
+            },
+            'task_selection_source': 'feedback_no_selectable_retired_lane_synthesis',
+        },
+        cfg,
+    )
+
+    assert parity['state'] == 'healthy'
+    assert 'current_task_drift' not in parity['reasons']
+    assert parity['canonical_current_task_id'] == 'synthesize-next-improvement-candidate'
+    assert parity['authority_resolution'] == 'fresh_live_synthesis_candidate'
+
+
 def test_subagent_visibility_hydrates_bridge_result_report_budget_and_artifacts(tmp_path: Path) -> None:
     repo_root = tmp_path / 'nanobot'
     db = tmp_path / 'dashboard.sqlite3'
@@ -1809,3 +1845,121 @@ def test_strong_reflection_freshness_falls_back_to_live_eeepc_artifact(tmp_path:
     assert result['source'] == 'eeepc'
     assert result['path'] == '/var/lib/eeepc-agent/self-evolving-agent/state/strong_reflection/latest.json'
     assert result['summary'].endswith('live')
+
+
+def test_remote_file_preview_kill_switch_avoids_request_time_ssh(tmp_path: Path, monkeypatch) -> None:
+    import nanobot_ops_dashboard.app as dashboard_app
+    from nanobot_ops_dashboard.app import _remote_file_preview
+
+    monkeypatch.delenv('NANOBOT_DASHBOARD_REMOTE_PREVIEWS', raising=False)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError('remote preview attempted request-time subprocess/ssh')
+
+    monkeypatch.setattr(dashboard_app.subprocess, 'run', fail_if_called)
+    key_path = tmp_path / 'eeepc.key'
+    key_path.write_text('test-key', encoding='utf-8')
+    cfg = DashboardConfig(
+        project_root=tmp_path / 'dashboard',
+        nanobot_repo_root=tmp_path / 'repo',
+        db_path=tmp_path / 'dashboard.sqlite3',
+        eeepc_ssh_host='eeepc',
+        eeepc_ssh_key=key_path,
+        eeepc_state_root='/var/lib/eeepc-agent/self-evolving-agent/state',
+    )
+
+    result = _remote_file_preview(
+        cfg,
+        '/var/lib/eeepc-agent/self-evolving-agent/state/reports/evolution-large.json',
+        max_chars=50000,
+    )
+
+    assert result == {
+        'path': '/var/lib/eeepc-agent/self-evolving-agent/state/reports/evolution-large.json',
+        'exists': False,
+        'preview': None,
+        'disabled': True,
+    }
+
+
+def test_remote_file_preview_can_be_enabled_for_explicit_operator_debug(tmp_path: Path, monkeypatch) -> None:
+    import nanobot_ops_dashboard.app as dashboard_app
+    from nanobot_ops_dashboard.app import _remote_file_preview
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"ok": true}', stderr='')
+
+    monkeypatch.setenv('NANOBOT_DASHBOARD_REMOTE_PREVIEWS', '1')
+    monkeypatch.setattr(dashboard_app.subprocess, 'run', fake_run)
+    key_path = tmp_path / 'eeepc.key'
+    key_path.write_text('test-key', encoding='utf-8')
+    cfg = DashboardConfig(
+        project_root=tmp_path / 'dashboard',
+        nanobot_repo_root=tmp_path / 'repo',
+        db_path=tmp_path / 'dashboard.sqlite3',
+        eeepc_ssh_host='eeepc',
+        eeepc_ssh_key=key_path,
+        eeepc_state_root='/var/lib/eeepc-agent/self-evolving-agent/state',
+    )
+
+    result = _remote_file_preview(cfg, '/remote/report.json', max_chars=50000)
+
+    assert result['exists'] is True
+    assert result['preview'] == '{"ok": true}'
+    assert calls
+    cmd, kwargs = calls[0]
+    assert 'ssh' in cmd[0]
+    assert 'head -c 8000' in cmd[-1]
+    assert kwargs['timeout'] == 3
+
+
+def test_experiment_snapshot_exposes_budget_used_and_subagent_consumption(tmp_path: Path) -> None:
+    from nanobot_ops_dashboard.app import _experiment_snapshot_from_payload
+
+    payload = {
+        'schema_version': 'experiment-v1',
+        'experiment_id': 'experiment-cycle-293',
+        'result_status': 'PASS',
+        'budget': {'max_requests': 2},
+        'budget_used': {'requests': 1, 'tool_calls': 2, 'subagents': 1, 'elapsed_seconds': 0},
+        'subagent_consumption': {'schema_version': 'subagent-consumption-v1', 'consumed_count': 1},
+    }
+    path = tmp_path / 'experiment.json'
+    path.write_text(json.dumps(payload), encoding='utf-8')
+
+    snapshot = _experiment_snapshot_from_payload(payload, path)
+
+    assert snapshot is not None
+    assert snapshot['budget_used']['subagents'] == 1
+    assert snapshot['subagent_consumption']['consumed_count'] == 1
+
+
+def test_hypotheses_visibility_reconciles_stale_selection_to_runtime_canonical_task() -> None:
+    from nanobot_ops_dashboard.app import _reconcile_hypotheses_visibility_with_runtime
+
+    visibility = {
+        'selected_hypothesis_id': 'inspect-pass-streak',
+        'selected_hypothesis_title': 'Inspect repeated PASS streak',
+        'mismatch_reasons': [],
+        'top_entries': [
+            {'hypothesis_id': 'record-reward', 'title': 'Record cycle reward'},
+            {'hypothesis_id': 'inspect-pass-streak', 'title': 'Inspect repeated PASS streak'},
+        ],
+    }
+    runtime_parity = {
+        'state': 'healthy',
+        'canonical_current_task_id': 'record-reward',
+        'authority_resolution': 'fresh_live_post_materialization_reward',
+        'reasons': [],
+    }
+
+    reconciled = _reconcile_hypotheses_visibility_with_runtime(visibility, runtime_parity)
+
+    assert reconciled['selected_hypothesis_id'] == 'record-reward'
+    assert reconciled['selected_hypothesis_title'] == 'Record cycle reward'
+    assert reconciled['runtime_reconciled_selected_hypothesis'] is True
+    assert reconciled['stale_selected_hypothesis_id'] == 'inspect-pass-streak'
+    assert 'selected_hypothesis_reconciled_to_runtime' in reconciled['mismatch_reasons']
