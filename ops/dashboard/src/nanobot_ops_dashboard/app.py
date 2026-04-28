@@ -257,6 +257,63 @@ def _experiment_truth_summary(snapshot: dict | None) -> dict | None:
     }
 
 
+def _compact_selfevo_issue_reference(value: dict | None) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    nested_issue = value.get('selfevo_issue') if isinstance(value.get('selfevo_issue'), dict) else {}
+    pr = value.get('pr') if isinstance(value.get('pr'), dict) else {}
+    compact = {
+        'number': value.get('number') or value.get('issue_number') or nested_issue.get('number') or nested_issue.get('issue_number'),
+        'title': value.get('title') or value.get('issue_title') or nested_issue.get('title') or nested_issue.get('issue_title'),
+        'url': value.get('url') or value.get('issue_url') or nested_issue.get('url') or nested_issue.get('issue_url'),
+        'state': value.get('state') or value.get('github_issue_state') or nested_issue.get('state') or nested_issue.get('github_issue_state'),
+        'terminal_status': value.get('terminal_status') or value.get('status') or nested_issue.get('terminal_status') or nested_issue.get('status'),
+        'retry_allowed': value.get('retry_allowed') if 'retry_allowed' in value else nested_issue.get('retry_allowed'),
+        'branch': value.get('selfevo_branch') or value.get('branch') or nested_issue.get('selfevo_branch') or nested_issue.get('branch'),
+        'pr_number': value.get('pr_number') or pr.get('number') or nested_issue.get('pr_number'),
+        'pr_url': value.get('pr_url') or pr.get('url') or nested_issue.get('pr_url'),
+    }
+    return {key: compact_value for key, compact_value in compact.items() if _has_value(compact_value)}
+
+
+def _compact_selfevo_lifecycle_evidence(value):
+    if isinstance(value, list):
+        return [_compact_selfevo_lifecycle_evidence(item) for item in value[:20]]
+    if not isinstance(value, dict):
+        return value
+    compact: dict = {}
+    for key, item in value.items():
+        if key == 'selfevo_issue':
+            issue = _compact_selfevo_issue_reference(item if isinstance(item, dict) else value)
+            if issue:
+                compact[key] = issue
+            continue
+        if key in {'last_issue_lifecycle', 'terminal_selfevo_issue'} and isinstance(item, dict):
+            lifecycle = _compact_selfevo_lifecycle_evidence(item)
+            if isinstance(lifecycle, dict):
+                compact_lifecycle = {k: lifecycle.get(k) for k in ('status', 'issue_number', 'issue_title', 'issue_url', 'pr_number', 'pr_url', 'selfevo_branch', 'github_issue_state', 'retry_allowed', 'selfevo_issue') if _has_value(lifecycle.get(k))}
+                pr = item.get('pr') if isinstance(item.get('pr'), dict) else {}
+                if _has_value(pr.get('number')) and not _has_value(compact_lifecycle.get('pr_number')):
+                    compact_lifecycle['pr_number'] = pr.get('number')
+                if _has_value(pr.get('url')) and not _has_value(compact_lifecycle.get('pr_url')):
+                    compact_lifecycle['pr_url'] = pr.get('url')
+                compact[key] = compact_lifecycle
+            continue
+        if key in {'raw_json', 'stdout', 'stderr', 'stdout_tail', 'stderr_tail'}:
+            if isinstance(item, str) and len(item) > 500:
+                compact[key] = item[:500] + '…'
+            else:
+                compact[key] = item
+            continue
+        if isinstance(item, dict):
+            compact[key] = _compact_selfevo_lifecycle_evidence(item)
+        elif isinstance(item, list):
+            compact[key] = _compact_selfevo_lifecycle_evidence(item)
+        else:
+            compact[key] = item
+    return compact
+
+
 def _material_progress_summary(material_progress: dict | None) -> dict:
     material_progress = dict(material_progress) if isinstance(material_progress, dict) else {}
     if not material_progress:
@@ -271,6 +328,7 @@ def _material_progress_summary(material_progress: dict | None) -> dict:
             'qualifying_proofs': [],
             'blocking_reason': 'material_progress_unavailable',
         }
+    material_progress = _compact_selfevo_lifecycle_evidence(material_progress)
     material_progress.setdefault('schema_version', 'material-progress-v1')
     material_progress.setdefault('available', True)
     return material_progress
@@ -2657,6 +2715,31 @@ def _compact_observation_group(item: dict) -> dict:
     }
 
 
+def _approval_snapshot(row) -> dict | None:
+    compact = _compact_collection_row(row)
+    if compact is None:
+        return None
+    plan_snapshot = _plan_snapshot_from_row(row)
+    compact['approval_gate'] = row.get('approval_gate') if isinstance(row, dict) else None
+    compact['plan_snapshot'] = {
+        'collected_at': plan_snapshot.get('collected_at'),
+        'source': plan_snapshot.get('source'),
+        'status': plan_snapshot.get('status'),
+        'current_task_id': plan_snapshot.get('current_task_id'),
+        'current_task': plan_snapshot.get('current_task'),
+        'task_count': plan_snapshot.get('task_count'),
+        'reward_signal': plan_snapshot.get('reward_signal'),
+        'reward_signal_text': plan_snapshot.get('reward_signal_text'),
+        'feedback_decision': _compact_selfevo_lifecycle_evidence(plan_snapshot.get('feedback_decision')) if isinstance(plan_snapshot.get('feedback_decision'), dict) else plan_snapshot.get('feedback_decision'),
+        'selected_tasks_text': plan_snapshot.get('selected_tasks_text'),
+        'selected_task_title': plan_snapshot.get('selected_task_title'),
+        'task_selection_source': plan_snapshot.get('task_selection_source'),
+        'plan_history_count': plan_snapshot.get('plan_history_count'),
+        'plan_payload_source': plan_snapshot.get('plan_payload_source'),
+    }
+    return compact
+
+
 
 def _deployment_snapshot(row, plan_snapshot):
     compact = _compact_collection_row(row)
@@ -3466,8 +3549,7 @@ def create_app(cfg: DashboardConfig):
         if path == '/api/approvals':
             payload = {
                 'items': [
-                    {**dict(r), 'plan_snapshot': _plan_snapshot_from_row(r)}
-                    for r in (eeepc_rows + repo_rows)
+                    snapshot for snapshot in (_approval_snapshot(r) for r in (eeepc_rows + repo_rows)) if snapshot is not None
                 ],
             }
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
