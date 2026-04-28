@@ -40,6 +40,7 @@ CORE_TASK_IDS = {
     "run-bounded-turn",
     "record-reward",
 }
+SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID = "synthesize-next-improvement-candidate"
 
 COMPLETED_TASK_STATUSES = {
     "blocked",
@@ -65,6 +66,7 @@ TASK_ACTION_CLASS_BY_ID = {
     "inspect-pass-streak": "review",
     "materialize-pass-streak-improvement": "execution",
     "subagent-verify-materialized-improvement": "review",
+    SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID: "review",
 }
 
 
@@ -125,6 +127,21 @@ def _task_is_selectable(task: dict[str, Any] | None) -> bool:
     return status not in COMPLETED_TASK_STATUSES
 
 
+def _task_is_terminal_selfevo_retired(task: dict[str, Any] | None, terminal_selfevo_issue: dict[str, Any] | None) -> bool:
+    if not isinstance(task, dict) or not isinstance(terminal_selfevo_issue, dict):
+        return False
+    if task.get("task_id") != "analyze-last-failed-candidate":
+        return False
+
+    terminal_status = str(terminal_selfevo_issue.get("terminal_status") or "").strip().lower()
+    if not terminal_status:
+        return False
+
+    task_status = _task_status(task)
+    terminal_reason = str(task.get("terminal_reason") or "").strip().lower()
+    return task_status == terminal_status or terminal_reason == terminal_status
+
+
 def _render_task_selection(task: dict[str, Any]) -> str:
     task_id = task.get("task_id") or task.get("taskId")
     task_title = task.get("title") or task.get("summary") or task_id or "task"
@@ -163,6 +180,26 @@ def _pick_task_for_classes(
         if task_id != current_task_id:
             return task
     return None
+
+
+def _synthesized_next_improvement_candidate(
+    *,
+    current_task_id: str | None,
+    strong_pass_count: int,
+    goal_artifact_signature: list[str] | None,
+    status: str = "pending",
+) -> dict[str, Any]:
+    return {
+        "task_id": SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID,
+        "title": "Synthesize one new bounded improvement candidate from retired lanes",
+        "status": status,
+        "kind": "review",
+        "acceptance": "produce one new bounded improvement candidate that is not a retired terminal/completed lane",
+        "selection_source": "feedback_no_selectable_retired_lane_synthesis",
+        "parent_task_id": current_task_id,
+        "strong_pass_count": strong_pass_count,
+        "goal_artifact_signature": goal_artifact_signature,
+    }
 
 
 def _history_failure_class(history_entry: dict[str, Any]) -> str | None:
@@ -471,6 +508,16 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
                     selected_task = task
                     selection_source = "feedback_pass_streak_switch"
                     break
+        if selected_task is None:
+            mode = "synthesize_next_candidate"
+            reason = "goal/artifact PASS retirement pressure reached with no selectable bounded lane; synthesize a new bounded improvement candidate"
+            selected_task = _synthesized_next_improvement_candidate(
+                current_task_id=current_task_id,
+                strong_pass_count=strong_pass_count,
+                goal_artifact_signature=list(str(value) for value in strong_pass_signature) if strong_pass_signature else None,
+                status="active",
+            )
+            selection_source = "feedback_no_selectable_retired_lane_synthesis"
 
     decision = {
         "mode": mode,
@@ -1376,6 +1423,9 @@ def _build_task_plan_snapshot(
     failure_learning_is_fresh = isinstance(latest_failure_learning, dict) and isinstance(latest_failure_learning.get('_age_seconds'), int) and latest_failure_learning.get('_age_seconds') <= 3600
     terminal_selfevo_issue = resolve_terminal_selfevo_issue(workspace=workspace, source_task_id='analyze-last-failed-candidate')
     terminal_selfevo_retired = False
+    recorded_terminal_selfevo_task = next((task for task in tasks if task.get('task_id') == 'analyze-last-failed-candidate'), None)
+    if _task_is_terminal_selfevo_retired(recorded_terminal_selfevo_task, terminal_selfevo_issue):
+        terminal_selfevo_retired = True
     recorded_feedback_decision_for_repair = recorded_task_plan.get('feedback_decision') if 'recorded_task_plan' in locals() and isinstance(recorded_task_plan, dict) and isinstance(recorded_task_plan.get('feedback_decision'), dict) else {}
     recorded_reward_retirement = (
         isinstance(recorded_feedback_decision_for_repair, dict)
@@ -1583,6 +1633,19 @@ def _build_task_plan_snapshot(
         failure_learning=latest_failure_learning,
         retire_analyze_last_failed_candidate=terminal_selfevo_issue is not None,
     )
+    if (
+        isinstance(feedback_decision, dict)
+        and feedback_decision.get("selected_task_id") == SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID
+        and not any(candidate.get("task_id") == SYNTHESIZE_NEXT_IMPROVEMENT_CANDIDATE_ID for candidate in generated_candidates)
+    ):
+        generated_candidates.append(
+            _synthesized_next_improvement_candidate(
+                current_task_id=current_task_id,
+                strong_pass_count=int(feedback_decision.get("strong_pass_count") or 0),
+                goal_artifact_signature=feedback_decision.get("goal_artifact_signature") if isinstance(feedback_decision.get("goal_artifact_signature"), list) else None,
+                status="active",
+            )
+        )
     carried_candidates = [dict(item) for item in recorded_generated_candidates if isinstance(item, dict)] if 'recorded_generated_candidates' in locals() else []
     inferred_candidates = _inferred_generated_candidates_from_tasks(tasks)
     combined_candidates: list[dict[str, Any]] = []
