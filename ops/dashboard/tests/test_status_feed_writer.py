@@ -123,6 +123,8 @@ def test_append_status_feed_prefers_stale_live_task_when_multiple_in_progress_ta
     assert entry['status_snapshot_summary']['stale_execution_detected'] is True
     assert entry['status_snapshot_summary']['stale_execution_incidents'] == 0
     assert entry['current_live_task_or_state']['stale_execution_detected'] is True
+    assert entry['current_live_task_or_state']['stale_execution_recommended_next_action'].startswith('Treat this as a stale-execution incident')
+    assert entry['current_live_task_or_state']['stale_execution_age_seconds'] > 0
     assert entry['current_live_task_or_state']['active_goal'] == 'goal-44e50921129bf475'
 
     refreshed = json.loads(active_execution_path.read_text(encoding='utf-8'))
