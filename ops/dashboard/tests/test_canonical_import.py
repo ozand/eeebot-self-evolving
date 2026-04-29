@@ -61,6 +61,25 @@ def test_stale_execution_controllers_default_to_canonical_dashboard_root():
     assert redispatch_controller.LATEST_ASSIGNMENT_PATH == expected_control_root / "execution_assignment.json"
 
 
+def test_generated_dashboard_control_artifacts_are_ignored():
+    check_paths = [
+        'ops/dashboard/control/stale_execution_incidents/20990101T000000Z-runtime-generated.json',
+        'ops/dashboard/control/stale_execution_next_actions/20990101T000000Z-runtime-generated.json',
+        'ops/dashboard/control/stale_execution_redispatches/20990101T000000Z-runtime-generated.json',
+        'ops/dashboard/control/execution_assignments/20990101T000000Z-runtime-generated.json',
+    ]
+    result = subprocess.run(
+        ['git', 'check-ignore', *check_paths],
+        cwd=CANONICAL_REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    ignored = set(result.stdout.splitlines())
+    assert ignored == set(check_paths)
+
+
+
 def test_imported_dashboard_readme_marks_sibling_repo_as_noncanonical():
     readme = (DASHBOARD_ROOT / "README.md").read_text()
 
