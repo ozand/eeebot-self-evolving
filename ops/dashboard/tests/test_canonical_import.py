@@ -79,6 +79,24 @@ def test_generated_dashboard_control_artifacts_are_ignored():
     assert ignored == set(check_paths)
 
 
+def test_checked_in_dashboard_control_baselines_remain_tracked():
+    baseline_paths = [
+        'ops/dashboard/control/stale_execution_incidents/20260416T114049015519Z-stagnating_on_quality_blocker-goal-44e50921129bf475-var-lib-eeepc-agent-self-evolving-agent-state-reports-evolution-20260416T121151Z.json-no_concrete_change-planner_hardening.json',
+        'ops/dashboard/control/stale_execution_next_actions/20260416T114049015519Z-stagnating_on_quality_blocker-goal-44e50921129bf475-var-lib-eeepc-agent-self-evolving-agent-state-reports-evolution-20260416T121151Z.json-no_concrete_change-planner_hardening.json',
+        'ops/dashboard/control/stale_execution_redispatches/20260417T022553513622Z-stagnating_on_quality_blocker-goal-44e50921129bf475-var-lib-eeepc-agent-self-evolving-agent-state-reports-evolution-20260416T121151Z.json-no_concrete_change-planner_hardening.json',
+        'ops/dashboard/control/execution_assignments/20260417T024647743230Z-stagnating_on_quality_blocker-goal-44e50921129bf475-var-lib-eeepc-agent-self-evolving-agent-state-reports-evolution-20260416T121151Z.json-no_concrete_change-planner_hardening.json',
+    ]
+    result = subprocess.run(
+        ['git', 'ls-files', *baseline_paths],
+        cwd=CANONICAL_REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    tracked = set(result.stdout.splitlines())
+    assert tracked == set(baseline_paths)
+
+
 
 def test_imported_dashboard_readme_marks_sibling_repo_as_noncanonical():
     readme = (DASHBOARD_ROOT / "README.md").read_text()
