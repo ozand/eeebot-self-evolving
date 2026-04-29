@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -16,7 +17,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import scripts.build_status_snapshot as status_snapshot
 
-ROOT = Path('/home/ozand/herkoot/Projects/nanobot-ops-dashboard')
+ROOT = Path(__file__).resolve().parents[1]
 ACTIVE_EXECUTION_PATH = ROOT / 'control' / 'active_execution.json'
 QUEUE_PATH = ROOT / 'control' / 'execution_queue.json'
 ASSIGNMENT_DIR = ROOT / 'control' / 'execution_assignments'
@@ -60,7 +61,11 @@ def task_key(task: dict[str, Any]) -> str:
 
 
 def artifact_task_key(task: dict[str, Any]) -> str:
-    return slugify(task_key(task))
+    key = slugify(task_key(task))
+    if len(key) <= 96:
+        return key
+    digest = hashlib.sha256(key.encode('utf-8')).hexdigest()[:12]
+    return f'{key[:72].rstrip("-._")}-{digest}'
 
 
 def timestamp_slug(timestamp: str) -> str:
@@ -112,6 +117,15 @@ def refresh_active_execution(active_execution_path: Path, queue_path: Path, task
 
 def assignment_path(assignment_dir: Path, task: dict[str, Any], assignment_created_at: str) -> Path:
     return assignment_dir / f'{timestamp_slug(assignment_created_at)}-{artifact_task_key(task)}.json'
+
+
+def path_is_within_directory(path: Path, directory: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(directory.resolve())
+    except AttributeError:
+        resolved_path = path.resolve()
+        resolved_directory = directory.resolve()
+        return resolved_directory == resolved_path or resolved_directory in resolved_path.parents
 
 
 def find_existing_assignment(
@@ -235,6 +249,24 @@ def consume_queued_redispatch_assignment(
             existing_assignment_path = Path(existing_assignment_path_value.strip())
             existing_assignment = load_json(existing_assignment_path, None) if existing_assignment_path.exists() else None
             if isinstance(existing_assignment, dict):
+                if not path_is_within_directory(existing_assignment_path, assignment_dir):
+                    updated_task = deepcopy(task)
+                    updated_task['status'] = 'stale_blocked'
+                    updated_task['queue_status'] = 'stale_blocked'
+                    updated_task['execution_state'] = 'needs_redispatch'
+                    tasks[index] = updated_task
+                    atomic_write_json(queue_path, {'tasks': tasks})
+                    active_execution = refresh_active_execution(active_execution_path, queue_path, tasks, now_utc())
+                    return {
+                        'consumed': False,
+                        'reason': 'external_assignment_path_not_canonical',
+                        'task_index': index,
+                        'task_key': task_key(task),
+                        'assignment_path': str(existing_assignment_path),
+                        'status': updated_task['status'],
+                        'execution_state': updated_task['execution_state'],
+                        'has_live_delegated_execution': active_execution.get('has_actually_executing_task'),
+                    }
                 active_execution = refresh_active_execution(active_execution_path, queue_path, tasks, now_utc())
                 return {
                     'consumed': False,

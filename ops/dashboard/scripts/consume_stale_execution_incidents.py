@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -17,7 +18,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 from scripts.build_status_snapshot import build_active_execution
 from scripts.stale_execution_watchdog import DEFAULT_THRESHOLD_MINUTES, detect_stale_execution
 
-ROOT = Path('/home/ozand/herkoot/Projects/nanobot-ops-dashboard')
+ROOT = Path(__file__).resolve().parents[1]
 ACTIVE_EXECUTION_PATH = ROOT / 'control' / 'active_execution.json'
 QUEUE_PATH = ROOT / 'control' / 'execution_queue.json'
 INCIDENT_DIR = ROOT / 'control' / 'stale_execution_incidents'
@@ -64,7 +65,11 @@ def task_key(task: dict[str, Any]) -> str:
 
 
 def artifact_task_key(task: dict[str, Any]) -> str:
-    return slugify(task_key(task))
+    key = slugify(task_key(task))
+    if len(key) <= 96:
+        return key
+    digest = hashlib.sha256(key.encode('utf-8')).hexdigest()[:12]
+    return f'{key[:72].rstrip("-._")}-{digest}'
 
 
 def parse_timestamp(value: Any) -> datetime | None:
