@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from nanobot.runtime.state import _material_progress_snapshot, _subagent_rollup_snapshot, format_runtime_state, load_runtime_state, load_runtime_state_from_root, resolve_runtime_state_location
-from nanobot.runtime.coordinator import _build_task_plan_snapshot, _derive_feedback_decision, run_self_evolving_cycle
+from nanobot.runtime.coordinator import _build_task_plan_snapshot, _derive_feedback_decision, _write_subagent_request_artifact, run_self_evolving_cycle
 
 
 def _read_json(path):
@@ -788,10 +789,70 @@ def test_cycle_materializes_synthesized_execution_lane_artifact_and_completes(tm
     assert request["schema_version"] == "subagent-request-v1"
     assert request["task_id"] == "subagent-verify-materialized-improvement"
     assert request["source_artifact"] == artifact_path
+    materialization_summary = current.get("subagent_materialization_summary")
+    assert materialization_summary["schema_version"] == "subagent-materializer-summary-v1"
+    assert materialization_summary["terminalized_count"] == 1
+    assert materialization_summary["blocked_result_count"] == 1
+    result_path = Path(materialization_summary["results"][0]["path"])
+    result = _read_json(result_path)
+    assert result["schema_version"] == "subagent-result-v1"
+    assert result["status"] == "blocked"
+    assert result["request_path"] == request_path
+    latest_report = _read_json(tmp_path / "state" / "outbox" / "report.index.json")
+    assert latest_report["subagent_materialization_summary"]["terminalized_count"] == 1
     assert current["budget_used"]["subagents"] >= 1
     assert any(task.get("task_id") == "materialize-synthesized-improvement" and task.get("status") == "done" for task in current["tasks"])
     assert any(task.get("task_id") == "subagent-verify-materialized-improvement" and task.get("status") == "active" for task in current["tasks"])
     assert all(task.get("task_id") != "materialize-synthesized-improvement" or task.get("status") != "active" for task in current["tasks"])
+
+
+def test_cycle_executes_configured_subagent_executor_and_consumes_completed_result(tmp_path, monkeypatch):
+    approvals_dir = tmp_path / "state" / "approvals"
+    approvals_dir.mkdir(parents=True)
+    expires_at = datetime(2026, 4, 15, 13, 0, tzinfo=timezone.utc)
+    (approvals_dir / "apply.ok").write_text(json.dumps({"expires_at_utc": expires_at.isoformat(), "ttl_minutes": 60}), encoding="utf-8")
+
+    executor = tmp_path / "fake_executor.py"
+    executor.write_text("import sys; _=sys.stdin.read(); print('FAKE EXECUTOR COMPLETE')", encoding="utf-8")
+    monkeypatch.setenv("NANOBOT_SUBAGENT_EXECUTOR_COMMAND", f"{sys.executable} {executor}")
+
+    goals_dir = tmp_path / "state" / "goals"
+    goals_dir.mkdir(parents=True)
+    (goals_dir / "current.json").write_text(
+        json.dumps({
+            "schema_version": "task-plan-v1",
+            "current_task_id": "materialize-synthesized-improvement",
+            "tasks": [
+                {"task_id": "record-reward", "title": "Record cycle reward", "status": "pending"},
+                {"task_id": "materialize-synthesized-improvement", "title": "Materialize one bounded improvement from the synthesized candidate", "status": "active", "kind": "execution"},
+            ],
+            "generated_candidates": [
+                {"task_id": "materialize-synthesized-improvement", "title": "Materialize one bounded improvement from the synthesized candidate", "status": "active", "kind": "execution"}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    summary = asyncio.run(
+        run_self_evolving_cycle(
+            workspace=tmp_path,
+            tasks="materialize synthesized improvement",
+            execute_turn=AsyncMock(return_value="agent completed synthesized materialization"),
+            now=expires_at - timedelta(minutes=30),
+        )
+    )
+
+    assert "PASS" in summary
+    current = _read_json(tmp_path / "state" / "goals" / "current.json")
+    materialization = current["subagent_materialization_summary"]
+    assert materialization["terminalized_count"] == 1
+    assert materialization["executed_count"] == 1
+    result = _read_json(materialization["results"][0]["path"])
+    assert result["status"] == "completed"
+    assert "FAKE EXECUTOR COMPLETE" in result["summary"]
+    assert current["subagent_consumption"]["consumed_count"] == 1
+    assert current["subagent_consumption"]["result_paths"] == [materialization["results"][0]["path"]]
+
 
 
 def test_completed_synthesized_candidate_pair_returns_to_reward_instead_of_replaying_parent(tmp_path):
@@ -2033,6 +2094,44 @@ def test_subagent_rollup_materializes_terminal_telemetry_for_matching_request(tm
     assert rollup["active_task_linkage"]["result_status"] == "done"
     assert rollup["active_task_linkage"]["source"] == "task_plan"
     assert rollup["latest_request"]["materialized_result_path"].endswith("terminal-result.json")
+
+
+def test_subagent_request_artifact_uses_generation_scoped_identity(tmp_path):
+    state_root = tmp_path / "state"
+    artifact_a = state_root / "improvements" / "materialized-cycle-a.json"
+    artifact_b = state_root / "improvements" / "materialized-cycle-b.json"
+    artifact_a.parent.mkdir(parents=True)
+    artifact_a.write_text(json.dumps({"cycle_id": "cycle-a"}), encoding="utf-8")
+    artifact_b.write_text(json.dumps({"cycle_id": "cycle-b"}), encoding="utf-8")
+
+    def write_request(cycle_id, artifact):
+        return _write_subagent_request_artifact(
+            state_root=state_root,
+            cycle_id=cycle_id,
+            goal_id="goal-bootstrap",
+            current_plan={
+                "current_task_id": "subagent-verify-materialized-improvement",
+                "current_task": "Verify materialized artifact",
+                "materialized_improvement_artifact_path": str(artifact),
+                "feedback_decision": {"mode": "handoff_to_subagent_verification", "artifact_path": str(artifact)},
+                "tasks": [{"task_id": "subagent-verify-materialized-improvement", "title": "Verify materialized artifact"}],
+            },
+        )
+
+    request_a = _read_json(write_request("cycle-a", artifact_a))
+    request_b = _read_json(write_request("cycle-b", artifact_b))
+
+    assert request_a["task_id"] == "subagent-verify-materialized-improvement"
+    assert request_b["task_id"] == "subagent-verify-materialized-improvement"
+    assert request_a["semantic_task_id"] == "subagent-verify-materialized-improvement"
+    assert request_b["semantic_task_id"] == "subagent-verify-materialized-improvement"
+    assert request_a["request_id"] != request_b["request_id"]
+    assert request_a["verification_task_id"] != request_b["verification_task_id"]
+    assert request_a["request_id"].startswith("subagent-verify-materialized-improvement-cycle-a")
+    assert request_b["request_id"].startswith("subagent-verify-materialized-improvement-cycle-b")
+    assert request_a["source_artifact"] == str(artifact_a)
+    assert request_b["source_artifact"] == str(artifact_b)
+
 
 
 def test_subagent_materializer_executes_research_only_request_with_local_executor(tmp_path):
