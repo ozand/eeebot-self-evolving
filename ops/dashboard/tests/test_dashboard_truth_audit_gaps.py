@@ -581,7 +581,7 @@ def test_dashboard_runtime_parity_trusts_fresh_live_failure_learning_handoff_and
 
     system = _call_json(app, '/api/system')
     parity = system['runtime_parity']
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert parity['local_current_task_id'] == 'record-reward'
     assert parity['live_current_task_id'] == 'analyze-last-failed-candidate'
     assert parity['canonical_current_task_id'] == 'analyze-last-failed-candidate'
@@ -1051,9 +1051,11 @@ def test_api_system_and_plan_adopt_fresh_live_active_lane_when_local_task_is_sta
     system = _call_json(app, '/api/system')
     plan = _call_json(app, '/api/plan')
 
-    assert system['runtime_parity']['state'] == 'healthy'
+    assert system['runtime_parity']['state'] == 'authority_resolved_with_source_skew'
     assert system['runtime_parity']['authority_resolution'] == 'fresh_live_active_lane'
     assert system['runtime_parity']['canonical_current_task_id'] == 'synthesize-next-improvement-candidate'
+    assert system['runtime_parity']['source_skew']['state'] == 'skewed'
+    assert 'current_task_drift' in system['runtime_parity']['source_skew']['reasons']
     assert plan['current_plan_source'] == 'eeepc'
     assert plan['current_task_id'] == 'synthesize-next-improvement-candidate'
     assert plan['task_plan']['current_task_id'] == 'synthesize-next-improvement-candidate'
@@ -1086,7 +1088,7 @@ def test_runtime_parity_trusts_pass_streak_switch_to_reward_even_when_selected_t
 
     parity = _dashboard_runtime_parity(repo_plan, eeepc_plan, cfg)
 
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert parity['authority_resolution'] == 'fresh_live_pass_streak_switch'
     assert parity['canonical_current_task_id'] == 'record-reward'
     assert 'current_task_drift' not in parity['reasons']
@@ -1790,7 +1792,7 @@ def test_runtime_parity_adopts_fresh_live_synthesized_materialization_when_local
         cfg,
     )
 
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert 'current_task_drift' not in parity['reasons']
     assert parity['canonical_current_task_id'] == 'materialize-synthesized-improvement'
     assert parity['authority_resolution'] == 'fresh_live_synthesized_materialization'
@@ -1827,7 +1829,7 @@ def test_runtime_parity_adopts_fresh_live_post_materialization_reward_when_local
         cfg,
     )
 
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert 'current_task_drift' not in parity['reasons']
     assert parity['canonical_current_task_id'] == 'record-reward'
     assert parity['authority_resolution'] == 'fresh_live_post_materialization_reward'
@@ -1863,7 +1865,7 @@ def test_runtime_parity_adopts_fresh_live_synthesized_candidate_after_reward_rot
         cfg,
     )
 
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert 'current_task_drift' not in parity['reasons']
     assert parity['canonical_current_task_id'] == 'synthesize-next-improvement-candidate'
     assert parity['authority_resolution'] == 'fresh_live_synthesis_candidate'
@@ -1998,7 +2000,7 @@ def test_runtime_parity_adopts_fresh_live_hadi_handoff_when_local_task_is_stale(
         cfg,
     )
 
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert 'current_task_drift' not in parity['reasons']
     assert parity['canonical_current_task_id'] == 'subagent-verify-materialized-improvement'
     assert parity['authority_resolution'] == 'fresh_live_hadi_handoff'
@@ -2040,7 +2042,7 @@ def test_runtime_parity_adopts_fresh_live_pass_streak_switch_when_local_task_is_
         cfg,
     )
 
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert 'current_task_drift' not in parity['reasons']
     assert parity['canonical_current_task_id'] == 'inspect-pass-streak'
     assert parity['authority_resolution'] == 'fresh_live_pass_streak_switch'
@@ -2086,7 +2088,7 @@ def test_runtime_parity_adopts_live_terminal_selfevo_retirement_when_local_task_
         cfg,
     )
 
-    assert parity['state'] == 'healthy'
+    assert parity['state'] == 'authority_resolved_with_source_skew'
     assert 'current_task_drift' not in parity['reasons']
     assert parity['canonical_current_task_id'] == 'record-reward'
     assert parity['authority_resolution'] == 'fresh_live_terminal_selfevo_retire'
@@ -2360,7 +2362,7 @@ def test_runtime_parity_accepts_local_failure_learning_repair_over_stale_live_co
 
     result = _dashboard_runtime_parity(repo_plan, live_plan, cfg)
 
-    assert result['state'] == 'healthy'
+    assert result['state'] == 'authority_resolved_with_source_skew'
     assert result['reasons'] == []
     assert result['canonical_current_task_id'] == 'analyze-last-failed-candidate'
     assert result['authority_resolution'] == 'local_failure_learning_repair_over_stale_live_complete_lane'
@@ -2402,7 +2404,7 @@ def test_runtime_parity_adopts_fresh_live_active_lane_when_local_task_is_stale(t
 
     result = _dashboard_runtime_parity(repo_plan, live_plan, cfg)
 
-    assert result['state'] == 'healthy'
+    assert result['state'] == 'authority_resolved_with_source_skew'
     assert result['reasons'] == []
     assert result['canonical_current_task_id'] == 'synthesize-next-improvement-candidate'
     assert result['authority_resolution'] == 'fresh_live_active_lane'
@@ -2792,6 +2794,23 @@ def test_autonomy_verdict_blocks_historical_progress_when_recent_window_is_disca
     assert verdict['state'] == 'stagnant'
     assert 'recent_window_discard_only' in verdict['reasons']
     assert 'subagent_evidence_stale' in verdict['reasons']
+
+
+def test_autonomy_verdict_blocks_healthy_progress_when_subagent_request_is_queued_without_result(tmp_path: Path) -> None:
+    cfg = DashboardConfig(project_root=tmp_path / 'dashboard', nanobot_repo_root=tmp_path / 'nanobot', db_path=tmp_path / 'dashboard.sqlite3', eeepc_ssh_host='eeepc', eeepc_ssh_key=tmp_path / 'missing-key', eeepc_state_root='/state')
+
+    verdict = _autonomy_verdict(
+        analytics={'recent_status_sequence': [], 'current_streak': {'status': 'PASS', 'length': 3}},
+        plan_latest={'current_task_id': 'subagent-verify-materialized-improvement'},
+        experiment_visibility={'current_experiment': {'outcome': 'accept'}},
+        credits_visibility={'current': {}},
+        cfg=cfg,
+        material_progress={'schema_version': 'material-progress-v1', 'state': 'proven', 'healthy_autonomy_allowed': True},
+        subagent_visibility={'summary': {'queued_request_count': 1, 'result_count': 0, 'blocked_result_count': 0, 'stale_result_count': 0, 'fresh_result_count': 0}},
+    )
+
+    assert verdict['state'] == 'stagnant'
+    assert 'subagent_request_unresolved' in verdict['reasons']
 
 
 def test_ambition_utilization_escalates_rotating_synthesis_reward_window_when_subagents_and_tools_underused() -> None:
