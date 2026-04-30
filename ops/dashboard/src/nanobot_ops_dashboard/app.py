@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone, timedelta
@@ -12,7 +13,7 @@ from urllib.parse import parse_qs
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from .collector import collect_once
+from .collector import collect_once, _build_ssh_command
 from .config import DashboardConfig
 from .storage import count_collections, count_events, fetch_events, fetch_latest_collections
 from nanobot.runtime.state import _subagent_rollup_snapshot
@@ -688,6 +689,11 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
     waiting_dispatch = False if completion_terminal else (bool(live_task) and not has_executor_linkage)
     execution_state = 'completed' if completion_terminal else 'stale' if stale_exec else 'live' if live_exec else 'waiting_for_dispatch' if waiting_dispatch else 'idle'
     source_skew = _snapshot_source_skew(repo_latest, eeepc_latest)
+    material_progress_source = (
+        (eeepc_raw.get('material_progress') if isinstance(eeepc_raw, dict) else None)
+        or (producer_summary.get('material_progress') if isinstance(producer_summary, dict) else None)
+        or (repo_raw.get('material_progress') if isinstance(repo_raw, dict) else None)
+    )
     return {
         'active_goal': (eeepc_latest or {}).get('active_goal') or (repo_latest or {}).get('active_goal'),
         'repo_status': (repo_latest or {}).get('status'),
@@ -713,7 +719,7 @@ def _control_plane_summary(repo_latest, eeepc_latest, current_experiment, curren
         'prompt_mass': (producer_summary.get('prompt_mass') if isinstance(producer_summary, dict) else None),
         'owner_utility': (producer_summary.get('owner_utility') if isinstance(producer_summary, dict) else None),
         'subagent_rollup': (repo_raw.get('subagent_rollup') if isinstance(repo_raw, dict) else None) or (producer_summary.get('subagent_rollup') if isinstance(producer_summary, dict) else None),
-        'material_progress': _material_progress_summary((repo_raw.get('material_progress') if isinstance(repo_raw, dict) else None) or (eeepc_raw.get('material_progress') if isinstance(eeepc_raw, dict) else None) or (producer_summary.get('material_progress') if isinstance(producer_summary, dict) else None)),
+        'material_progress': _material_progress_summary(material_progress_source),
         'human_review_boundary': human_review_boundary,
         'governance_enforcement': governance_enforcement,
         'launch_criteria': {
@@ -823,37 +829,34 @@ def _remote_subagent_state_payload(cfg: DashboardConfig, state_root: str) -> dic
     remote_root = str(state_root).rstrip('/')
     if not remote_root or not getattr(cfg, 'eeepc_ssh_host', None):
         return {'ok': False, 'error': 'remote_root_or_host_missing'}
-    script = r'''
-import json, pathlib, time, datetime
+    script = f'''
+import json, pathlib, time
 root=pathlib.Path(__import__('sys').argv[1])
+limit=max(0, int(__import__('sys').argv[2]))
 now=time.time()
 def read(p):
     try:
         return json.loads(p.read_text())
     except Exception as exc:
-        return {'_error': str(exc)}
+        return {{'_error': str(exc)}}
 requests=[]
-for p in sorted((root/'subagents'/'requests').glob('*.json'), key=lambda x:x.stat().st_mtime, reverse=True)[:200]:
+for p in sorted((root/'subagents'/'requests').glob('*.json'), key=lambda x:x.stat().st_mtime, reverse=True)[:limit]:
     payload=read(p)
     request_id=payload.get('request_id') or payload.get('id')
     semantic=payload.get('semantic_task_id') or payload.get('task_id')
     status=payload.get('request_status') or payload.get('status') or 'queued'
-    requests.append({'path': str(p), 'source': 'eeepc', 'source_root': str(root), 'task_id': payload.get('task_id'), 'semantic_task_id': semantic, 'request_id': request_id, 'verification_task_id': payload.get('verification_task_id') or request_id, 'verification_role': payload.get('verification_role'), 'cycle_id': payload.get('cycle_id'), 'profile': payload.get('profile'), 'status': status, 'request_status': status, 'age_seconds': max(0, int(now-p.stat().st_mtime)), 'source_artifact': payload.get('source_artifact')})
+    requests.append({{'path': str(p), 'source': 'eeepc', 'source_root': str(root), 'task_id': payload.get('task_id'), 'semantic_task_id': semantic, 'request_id': request_id, 'verification_task_id': payload.get('verification_task_id') or request_id, 'verification_role': payload.get('verification_role'), 'cycle_id': payload.get('cycle_id'), 'profile': payload.get('profile'), 'status': status, 'request_status': status, 'age_seconds': max(0, int(now-p.stat().st_mtime)), 'source_artifact': payload.get('source_artifact')}})
 results=[]
-for p in sorted((root/'subagents'/'results').glob('*.json'), key=lambda x:x.stat().st_mtime, reverse=True)[:300]:
+for p in sorted((root/'subagents'/'results').glob('*.json'), key=lambda x:x.stat().st_mtime, reverse=True)[:limit]:
     payload=read(p)
     request_id=payload.get('request_id') or payload.get('id')
     semantic=payload.get('semantic_task_id') or payload.get('task_id')
-    results.append({'path': str(p), 'source': 'eeepc', 'source_root': str(root), 'request_path': payload.get('request_path'), 'request_id': request_id, 'semantic_task_id': semantic, 'verification_task_id': payload.get('verification_task_id') or request_id, 'verification_role': payload.get('verification_role'), 'report_path': payload.get('report_path') or payload.get('report_source'), 'task_id': payload.get('task_id'), 'cycle_id': payload.get('cycle_id'), 'status': payload.get('status') or payload.get('result_status') or 'completed', 'terminal_reason': payload.get('terminal_reason') or payload.get('reason'), 'summary': payload.get('summary'), 'age_seconds': max(0, int(now-p.stat().st_mtime)), 'source_artifact': payload.get('source_artifact')})
-print(json.dumps({'ok': True, 'source_root': str(root), 'requests': requests, 'results': results}, sort_keys=True))
+    results.append({{'path': str(p), 'source': 'eeepc', 'source_root': str(root), 'request_path': payload.get('request_path'), 'request_id': request_id, 'semantic_task_id': semantic, 'verification_task_id': payload.get('verification_task_id') or request_id, 'verification_role': payload.get('verification_role'), 'report_path': payload.get('report_path') or payload.get('report_source'), 'task_id': payload.get('task_id'), 'cycle_id': payload.get('cycle_id'), 'status': payload.get('status') or payload.get('result_status') or 'completed', 'terminal_reason': payload.get('terminal_reason') or payload.get('reason'), 'summary': payload.get('summary'), 'age_seconds': max(0, int(now-p.stat().st_mtime)), 'source_artifact': payload.get('source_artifact')}})
+print(json.dumps({{'ok': True, 'source_root': str(root), 'requests': requests, 'results': results}}, sort_keys=True))
 '''
-    shell_command = f"sudo -n python3 -c {json.dumps(script)} {json.dumps(remote_root)}"
-    ssh_cmd = [
-        'ssh', '-F', '/home/ozand/.ssh/config', '-i', str(cfg.eeepc_ssh_key),
-        '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4',
-        '-o', 'ServerAliveInterval=2', '-o', 'ServerAliveCountMax=1', cfg.eeepc_ssh_host,
-        f"bash -lc {json.dumps(shell_command)}",
-    ]
+    limit = max(0, int(getattr(cfg, 'max_subagent_records', 200) or 0))
+    remote_command = f"python3 -c {shlex.quote(script)} {shlex.quote(remote_root)} {limit}"
+    ssh_cmd = _build_ssh_command(cfg, remote_command)
     try:
         proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=8, check=True)
         payload = json.loads(proc.stdout or '{}')
@@ -1019,6 +1022,7 @@ def _discover_subagent_requests(cfg: DashboardConfig, stale_after_seconds: int =
             'canonical_state_root': str(canonical_state_root) if canonical_state_root else None,
             'local_available': bool(local_has_activity),
             'canonical_available': bool(canonical_has_activity),
+            'canonical_remote': bool(canonical_remote),
         },
         'source_skew': {
             'state': source_skew_state,
