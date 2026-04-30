@@ -535,6 +535,8 @@ def _derive_feedback_decision(task_plan: dict[str, Any] | None, goals_dir: Path)
             "strong_pass_count": strong_pass_count,
             "retire_goal_artifact_pair": False,
             "ambition_escalation": {
+                "state": "selected",
+                "blocker": None,
                 "schema_version": "hadi-ambition-escalation-v1",
                 "strategy": "hadi_materialize_after_discard_only_underuse",
                 "reasons": ambition_underutilization_reasons,
@@ -1767,6 +1769,17 @@ def _write_materialized_improvement_artifact(
         "summary": summary,
         "reward_signal": reward_signal,
         "feedback_decision": feedback_decision,
+        "hadi_cycle": {
+            "hypothesis": "A concrete bounded materialization will create stronger self-improvement evidence than another reward/candidate bookkeeping cycle.",
+            "action": "Materialize one reviewable improvement artifact and route it to a follow-up verification lane.",
+            "data": {
+                "task_id": current_task_id,
+                "reward_signal": reward_signal,
+                "feedback_mode": feedback_decision.get("mode") if isinstance(feedback_decision, dict) else None,
+                "ambition_escalation_reasons": ((feedback_decision.get("ambition_escalation") or {}).get("reasons") if isinstance(feedback_decision, dict) and isinstance(feedback_decision.get("ambition_escalation"), dict) else None),
+            },
+            "insight": "The artifact must either qualify as material progress or trigger explicit subagent verification/blocker handling.",
+        },
         "concrete_improvement_statement": concrete_statement,
         "rationale": rationale,
         "acceptance_checks": [
