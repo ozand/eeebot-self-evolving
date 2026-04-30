@@ -845,3 +845,31 @@ async def test_on_help_includes_restart_command() -> None:
     update.message.reply_text.assert_awaited_once()
     help_text = update.message.reply_text.await_args.args[0]
     assert "/restart" in help_text
+
+
+@pytest.mark.asyncio
+async def test_on_cap_status_replies_with_runtime_status(monkeypatch, tmp_path) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/cap_status", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.load_config",
+        lambda: SimpleNamespace(agents=SimpleNamespace(defaults=SimpleNamespace(workspace=str(tmp_path)))),
+    )
+    monkeypatch.setattr("nanobot.channels.telegram.load_runtime_state", lambda workspace: {"workspace": str(workspace)})
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.format_runtime_state",
+        lambda runtime: ["autonomy: runtime-command-router", "model: gpt-5.3-codex", f"workspace: {runtime['workspace']}"],
+    )
+
+    await channel._on_cap_status(update, None)
+
+    update.message.reply_text.assert_awaited_once()
+    reply_text = update.message.reply_text.await_args.args[0]
+    assert "autonomy:" in reply_text
+    assert "model: gpt-5.3-codex" in reply_text
+    assert f"workspace: {tmp_path}" in reply_text
