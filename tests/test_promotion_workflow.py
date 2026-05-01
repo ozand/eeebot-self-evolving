@@ -415,4 +415,3 @@ def test_supply_missing_promotion_readiness_inputs_writes_stronger_blocker_witho
     assert replay["recommended_next_action"] == "supply_source_commit_or_policy_override"
     assert replay["readiness_checks"]["provenance_complete"] is False
     assert replay["readiness_reasons"] == ["source_commit_missing"]
-
