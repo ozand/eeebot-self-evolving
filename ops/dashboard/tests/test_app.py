@@ -612,6 +612,67 @@ def test_reconcile_hypotheses_does_not_fabricate_missing_selection_from_runtime_
     assert reconciled.get('runtime_reconciled_selected_hypothesis') is not True
 
 
+def test_mission_control_skips_sentinel_blocker_reasons_before_concrete_readiness_reason():
+    payload = _mission_control_summary(
+        context=_minimal_mission_context(),
+        control_plane={},
+        current_blocker={'reason': 'unknown'},
+        material_progress={'schema_version': 'material-progress-v1', 'state': 'blocked', 'healthy_autonomy_allowed': False, 'proof_count': 0},
+        runtime_parity={'state': 'healthy'},
+        autonomy_verdict={
+            'state': 'stagnant',
+            'blocking_summary': {
+                'source': 'promotion_replay_readiness',
+                'readiness_reasons': ['unknown', 'source_commit_missing'],
+            },
+        },
+        hypotheses_visibility={},
+        experiment_visibility={},
+        subagent_visibility={},
+        analytics={},
+    )
+
+    assert payload['headline'] == 'Blocked: source_commit_missing'
+    assert payload['current_blocker']['reason'] == 'source_commit_missing'
+
+
+def test_mission_control_does_not_treat_single_task_id_as_source_skew_resolved():
+    payload = _mission_control_summary(
+        context=_minimal_mission_context(),
+        control_plane={},
+        current_blocker={'reason': 'source_commit_missing'},
+        material_progress={'schema_version': 'material-progress-v1', 'state': 'blocked', 'healthy_autonomy_allowed': False, 'proof_count': 0},
+        runtime_parity={'state': 'healthy', 'source_skew': True, 'canonical_current_task_id': 'synthesize-next-improvement-candidate'},
+        autonomy_verdict={'state': 'stagnant'},
+        hypotheses_visibility={},
+        experiment_visibility={},
+        subagent_visibility={},
+        analytics={},
+    )
+
+    truth = payload['truth_status']
+    assert truth['authority_resolution'] == 'unknown'
+    assert truth['source_skew_reason'] == 'unexplained_source_skew'
+
+
+def test_reconcile_hypotheses_does_not_overwrite_stale_selection_without_canonical_entry():
+    visibility = {
+        'selected_hypothesis_id': 'stale-hypothesis',
+        'selected_hypothesis_title': 'Stale hypothesis',
+        'top_entries': [{'hypothesis_id': 'other-hypothesis', 'title': 'Other hypothesis'}],
+        'mismatch_reasons': [],
+    }
+    reconciled = _reconcile_hypotheses_visibility_with_runtime(
+        visibility,
+        {'state': 'healthy', 'canonical_current_task_id': 'synthesize-next-improvement-candidate'},
+        {'current_task_id': 'synthesize-next-improvement-candidate', 'current_task': 'Synthesize one new bounded improvement candidate'},
+    )
+
+    assert reconciled['selected_hypothesis_id'] == 'stale-hypothesis'
+    assert reconciled['selected_hypothesis_title'] == 'Stale hypothesis'
+    assert reconciled.get('runtime_reconciled_selected_hypothesis') is not True
+
+
 def test_app_overview_prioritizes_mission_control_before_technical_evidence(tmp_path: Path):
     root = tmp_path / 'dashboard'
     db = root / 'data' / 'db.sqlite3'
