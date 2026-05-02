@@ -438,12 +438,21 @@ def _mission_control_summary(*, context: dict, control_plane: dict | None, curre
     hypothesis_id = hypothesis_selected.get('id') or hypotheses.get('selected_hypothesis_id')
     hypothesis_title = hypothesis_selected.get('title') or hypotheses.get('selected_hypothesis_title')
 
+    autonomy_blocking_summary = autonomy.get('blocking_summary') if isinstance(autonomy.get('blocking_summary'), dict) else {}
+    control_blocking_summary = control_plane.get('blocker_summary') if isinstance(control_plane.get('blocker_summary'), dict) else {}
     blocker_reason = current_blocker.get('failure_class') or current_blocker.get('kind') or current_blocker.get('reason')
+    if not blocker_reason or blocker_reason in {'unknown', 'none', 'clear'}:
+        readiness_reasons = autonomy_blocking_summary.get('readiness_reasons') if isinstance(autonomy_blocking_summary.get('readiness_reasons'), list) else []
+        missing_records = autonomy_blocking_summary.get('missing_records') if isinstance(autonomy_blocking_summary.get('missing_records'), list) else []
+        blocker_reason = next((str(reason) for reason in readiness_reasons if _has_value(reason)), None)
+        blocker_reason = blocker_reason or next((str(record) for record in missing_records if _has_value(record)), None)
+        blocker_reason = blocker_reason or autonomy_blocking_summary.get('reason') or control_blocking_summary.get('reason') or blocker_reason
     next_action_label = (
         current_blocker.get('blocked_next_step')
         or current_blocker.get('recommended_next_action')
+        or autonomy_blocking_summary.get('recommended_next_action')
         or autonomy.get('recommended_next_action')
-        or (control_plane.get('blocker_summary') or {}).get('recommended_next_action') if isinstance(control_plane.get('blocker_summary'), dict) else None
+        or control_blocking_summary.get('recommended_next_action')
     )
     if not next_action_label:
         next_action_label = 'inspect canonical state and continue the next bounded self-improvement cycle'
