@@ -468,9 +468,9 @@ def _mission_control_summary(*, context: dict, control_plane: dict | None, curre
     elif autonomy.get('state') in {'blocked', 'stagnant', 'degraded'}:
         blocker_state = autonomy.get('state')
 
-    material_state = material.get('state') or ('available' if material.get('healthy_autonomy_allowed') else 'missing')
-    if material.get('healthy_autonomy_allowed') or material.get('proof_count'):
-        material_state = 'available'
+    material_state = material.get('state')
+    if not material_state:
+        material_state = 'available' if material.get('healthy_autonomy_allowed') or material.get('proof_count') else 'missing'
     elif material_state in {'unavailable', 'missing_current_material_progress'}:
         material_state = 'missing'
 
@@ -503,6 +503,11 @@ def _mission_control_summary(*, context: dict, control_plane: dict | None, curre
         if latest_sub_status_key in successful_subagent_statuses or proof_status in successful_subagent_statuses:
             latest_consumed = True
             break
+    latest_result_blocker = latest_result.get('blocker') if isinstance(latest_result.get('blocker'), dict) else {}
+    latest_result_blocker_reason = latest_result_blocker.get('reason') or latest_result.get('terminal_reason') or latest_result.get('failure_class')
+    if latest_sub_status_key in terminal_subagent_statuses and latest_result_blocker_reason and str(latest_result_blocker_reason).lower() not in {'unknown', 'none', 'clear'}:
+        latest_consumed_as_blocker_evidence = True
+        latest_consumed = False
 
     parity_state = runtime_parity.get('state') or 'unknown'
     raw_authority_resolution = runtime_parity.get('authority_resolution') or runtime_parity.get('runtime_authority_resolution') or control_plane.get('runtime_authority_resolution')
@@ -652,7 +657,10 @@ def _mission_control_summary(*, context: dict, control_plane: dict | None, curre
         },
         'last_material_progress': {
             'state': material_state,
+            'canonical_state': material.get('state') or material_state,
+            'available': bool(material.get('available')) if 'available' in material else material_state not in {'missing', 'unavailable'},
             'reason': material.get('reason') or material.get('blocking_reason'),
+            'blocking_reason': material.get('blocking_reason') or material.get('reason'),
             'proof_count': material.get('proof_count') or 0,
             'qualifying_proofs': material.get('qualifying_proofs') or [],
             'healthy_autonomy_allowed': bool(material.get('healthy_autonomy_allowed')),
