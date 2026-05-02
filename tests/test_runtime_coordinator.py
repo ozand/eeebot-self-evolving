@@ -413,6 +413,44 @@ def test_cycle_promotes_supplied_readiness_inputs_to_ready_for_policy_review(tmp
     assert report_index["promotion"]["decision"] == "ready_for_policy_review"
 
 
+def test_load_runtime_state_classifies_ready_for_policy_review_as_pending_review(tmp_path):
+    state_root = tmp_path / "state"
+    promotions_dir = state_root / "promotions"
+    promotions_dir.mkdir(parents=True)
+    candidate_path = promotions_dir / "promotion-ready.json"
+    promotion = {
+        "schema_version": "promotion-record-v1",
+        "promotion_candidate_id": "promotion-ready",
+        "candidate_path": str(candidate_path),
+        "review_status": "ready_for_policy_review",
+        "decision": "ready_for_policy_review",
+        "decision_record": "pending_operator_review_packet",
+        "accepted_record": None,
+        "artifact_path": str(state_root / "improvements" / "materialized.json"),
+        "readiness_checks": {
+            "schema_version": "promotion-readiness-inputs-v1",
+            "artifact_present": True,
+            "evidence_refs_present": True,
+            "provenance_complete": True,
+            "missing_inputs": [],
+        },
+        "readiness_reasons": [],
+        "recommended_next_action": "ready_for_policy_review",
+        "promotion_provenance": {"source_commit": "abc123", "build_recipe_hash": "recipe"},
+    }
+    candidate_path.write_text(json.dumps(promotion), encoding="utf-8")
+    (promotions_dir / "latest.json").write_text(json.dumps(promotion), encoding="utf-8")
+
+    runtime = load_runtime_state(tmp_path)
+
+    replay = runtime["promotion_replay_readiness"]
+    assert runtime["review_status"] == "ready_for_policy_review"
+    assert runtime["decision"] == "ready_for_policy_review"
+    assert replay["state"] == "ready_for_policy_review"
+    assert replay["reason"] == "promotion_candidate_ready_for_policy_review"
+    assert replay["recommended_next_action"] == "ready_for_policy_review"
+
+
 def test_cycle_consumes_correlated_subagent_bridge_result_into_canonical_budget(tmp_path, monkeypatch):
     approvals_dir = tmp_path / "state" / "approvals"
     approvals_dir.mkdir(parents=True)
